@@ -6,7 +6,6 @@ import struct
 import time
 from pathlib import Path
 
-from proximity.transport_ble import BleTransport
 from proximity.transport_wifi import WifiTransport
 
 STATE_ROOT = Path(__file__).resolve().parent / "state"
@@ -47,5 +46,35 @@ def make_transport(name: str):
     if name == "wifi":
         return WifiTransport()
     if name == "ble":
+        from proximity.transport_ble import BleTransport
+
         return BleTransport()
     raise ValueError(f"unknown transport: {name}")
+
+
+def make_trust_manager(state_dir: Path):
+    """Trust manager for one device's `trust_db.json`, backed by `trust/`'s revocation/expiry
+    framework instead of the legacy binary `pairing/trust_store.py`.
+
+    If this is the first time a given device's state dir is opened under the new store and an
+    old `trust_store.json` already exists there (from pairing before this switch), migrates its
+    peers in once so existing pairings survive the switch -- see
+    `trust.integration.migrate_legacy_store`.
+    """
+    from trust import JsonTrustStore, TrustManager
+    from trust.integration import migrate_legacy_store
+
+    db_path = state_dir / "trust_db.json"
+    is_new = not db_path.exists()
+    manager = TrustManager(JsonTrustStore(db_path))
+
+    if is_new:
+        legacy_path = state_dir / "trust_store.json"
+        if legacy_path.exists():
+            from pairing.trust_store import TrustStore
+
+            migrated = migrate_legacy_store(manager, TrustStore(legacy_path))
+            if migrated:
+                log(state_dir.name, f"migrated {len(migrated)} peer(s) from legacy trust_store.json into trust_db.json")
+
+    return manager

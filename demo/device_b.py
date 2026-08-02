@@ -16,11 +16,12 @@ import argparse
 import socket
 import time
 
-from demo.common import device_state_dir, log, make_transport, send_framed
+from demo.common import device_state_dir, log, make_transport, make_trust_manager, send_framed
 from pairing.pairing_protocol import load_or_create_identity, respond_to_qr
 from pairing.qr_scan import scan_image_file, scan_webcam
-from pairing.trust_store import TrustStore
 from proximity.proximity_protocol import AuthenticationFailedError, UnpairedPeerError, respond_to_encounter
+from trust.exceptions import DuplicateDeviceError
+from trust.integration import ProtocolPeerStore, register_paired_peer
 
 DEVICE_ID = "device-b"
 
@@ -42,17 +43,22 @@ def cmd_pair(qr_image: str | None, peer_host: str, peer_port: int):
     with socket.create_connection((peer_host, peer_port), timeout=10) as conn:
         send_framed(conn, response)
 
-    trust_store = TrustStore(state / "trust_store.json")
-    trust_store.save_peer(peer["device_id"], peer["x25519_pub"], peer["mlkem_pub"], fingerprint)
+    manager = make_trust_manager(state)
+    try:
+        register_paired_peer(manager, peer, fingerprint)
+        log(DEVICE_ID, f"paired with {peer['device_id']}")
+    except DuplicateDeviceError:
+        log(DEVICE_ID, f"{peer['device_id']} is already a trusted peer -- re-pairing does not "
+                        "overwrite existing trust (revoke/remove it first via demo.trust_cli to re-register)")
 
-    log(DEVICE_ID, f"paired with {peer['device_id']}")
     log(DEVICE_ID, f"SAFETY NUMBER (compare with device-a): {fingerprint}")
 
 
-def cmd_proximity(transport_name: str, duration: float):
+def cmd_proximity(transport_name: str, duration: float, message: str | None, verbose: bool):
     state = device_state_dir(DEVICE_ID)
     identity = load_or_create_identity(DEVICE_ID, state / "identity.json")
-    trust_store = TrustStore(state / "trust_store.json")
+    manager = make_trust_manager(state)
+    peer_store = ProtocolPeerStore(manager)
 
     transport = make_transport(transport_name)
     transport.start(DEVICE_ID)
@@ -62,8 +68,9 @@ def cmd_proximity(transport_name: str, duration: float):
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             try:
-                token = f"presence-token-from-{DEVICE_ID}".encode()
-                peer_id, received = respond_to_encounter(transport, identity, trust_store, token, timeout=remaining)
+                token = message.encode() if message else f"presence-token-from-{DEVICE_ID}".encode()
+                peer_id, received = respond_to_encounter(transport, identity, peer_store, token, timeout=remaining, verbose=verbose)
+                peer_store.note_session_complete(peer_id)
                 log(DEVICE_ID, f"ACCEPTED {peer_id}: authenticated handshake complete, received token {received!r}")
             except UnpairedPeerError as e:
                 log(DEVICE_ID, f"REJECTED an unpaired peer: {e}")
@@ -85,6 +92,8 @@ def main():
     parser.add_argument("--proximity", action="store_true")
     parser.add_argument("--transport", choices=["wifi", "ble"], default="wifi")
     parser.add_argument("--duration", type=float, default=30.0, help="seconds to wait for proximity encounters")
+    parser.add_argument("--message", default=None, help="custom message to send back as the proximity token (default: presence-token-from-device-b)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print session key / nonce / ciphertext / plaintext for the encryption and decryption steps")
     args = parser.parse_args()
 
     if args.pair:
@@ -92,7 +101,7 @@ def main():
             parser.error("--pair requires --peer-port (printed by device_a --pair)")
         cmd_pair(args.qr_image, args.peer_host, args.peer_port)
     elif args.proximity:
-        cmd_proximity(args.transport, args.duration)
+        cmd_proximity(args.transport, args.duration, args.message, args.verbose)
     else:
         parser.print_help()
 

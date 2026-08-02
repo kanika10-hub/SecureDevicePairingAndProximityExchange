@@ -22,11 +22,12 @@ import argparse
 import socket
 import uuid
 
-from demo.common import device_state_dir, log, make_transport, recv_framed
+from demo.common import device_state_dir, log, make_transport, make_trust_manager, recv_framed
 from pairing.pairing_protocol import complete_pairing, load_or_create_identity, make_qr_payload
 from pairing.qr_generate import save_qr
-from pairing.trust_store import TrustStore
 from proximity.proximity_protocol import AuthenticationFailedError, UnpairedPeerError, initiate_encounter
+from trust.exceptions import DuplicateDeviceError
+from trust.integration import ProtocolPeerStore, register_paired_peer
 
 DEVICE_ID = "device-a"
 
@@ -53,26 +54,31 @@ def cmd_pair(port: int):
     server.close()
 
     fingerprint, peer = complete_pairing(identity, response)
-    trust_store = TrustStore(state / "trust_store.json")
-    trust_store.save_peer(peer["device_id"], peer["x25519_pub"], peer["mlkem_pub"], fingerprint)
+    manager = make_trust_manager(state)
+    try:
+        register_paired_peer(manager, peer, fingerprint)
+        log(DEVICE_ID, f"paired with {peer['device_id']}")
+    except DuplicateDeviceError:
+        log(DEVICE_ID, f"{peer['device_id']} is already a trusted peer -- re-pairing does not "
+                        "overwrite existing trust (revoke/remove it first via demo.trust_cli to re-register)")
 
-    log(DEVICE_ID, f"paired with {peer['device_id']}")
     log(DEVICE_ID, f"SAFETY NUMBER (compare with device-b): {fingerprint}")
 
 
-def cmd_proximity(transport_name: str, as_stranger: bool, discover_timeout: float):
+def cmd_proximity(transport_name: str, as_stranger: bool, discover_timeout: float, message: str | None, verbose: bool):
     if as_stranger:
         stranger_id = f"stranger-{uuid.uuid4().hex[:8]}"
         state = device_state_dir(stranger_id)
         identity = load_or_create_identity(stranger_id, state / "identity.json")
-        trust_store = TrustStore(state / "trust_store.json")  # deliberately empty: never paired
+        manager = make_trust_manager(state)  # deliberately empty: never paired
         my_id = stranger_id
     else:
         state = device_state_dir(DEVICE_ID)
         identity = load_or_create_identity(DEVICE_ID, state / "identity.json")
-        trust_store = TrustStore(state / "trust_store.json")
+        manager = make_trust_manager(state)
         my_id = DEVICE_ID
 
+    peer_store = ProtocolPeerStore(manager)
     transport = make_transport(transport_name)
     transport.start(my_id)
     log(my_id, f"advertising over {transport_name}, discovering nearby devices...")
@@ -83,9 +89,10 @@ def cmd_proximity(transport_name: str, as_stranger: bool, discover_timeout: floa
             log(my_id, "no peers found -- is device-b running --proximity too?")
 
         for peer_id in peers:
-            token = f"presence-token-from-{my_id}".encode()
+            token = message.encode() if message else f"presence-token-from-{my_id}".encode()
             try:
-                received = initiate_encounter(transport, identity, trust_store, peer_id, token)
+                received = initiate_encounter(transport, identity, peer_store, peer_id, token, verbose=verbose)
+                peer_store.note_session_complete(peer_id)
                 log(my_id, f"ACCEPTED by {peer_id}: authenticated handshake complete, received token {received!r}")
             except UnpairedPeerError as e:
                 log(my_id, f"SKIPPED {peer_id}: {e}")
@@ -105,12 +112,14 @@ def main():
     parser.add_argument("--transport", choices=["wifi", "ble"], default="wifi")
     parser.add_argument("--as-stranger", action="store_true", help="use a fresh unpaired identity (demonstrates rejection)")
     parser.add_argument("--discover-timeout", type=float, default=5.0)
+    parser.add_argument("--message", default=None, help="custom message to send as the proximity token (default: presence-token-from-device-a)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print session key / nonce / ciphertext / plaintext for the encryption and decryption steps")
     args = parser.parse_args()
 
     if args.pair:
         cmd_pair(args.port)
     elif args.proximity:
-        cmd_proximity(args.transport, args.as_stranger, args.discover_timeout)
+        cmd_proximity(args.transport, args.as_stranger, args.discover_timeout, args.message, args.verbose)
     else:
         parser.print_help()
 

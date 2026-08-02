@@ -122,7 +122,7 @@ def unpack_token(data: bytes) -> tuple[bytes, bytes]:
 
 
 def initiate_encounter(transport, my_identity: Identity, trust_store: TrustStore, peer_id: str,
-                        token: bytes, timeout: float = 10.0) -> bytes:
+                        token: bytes, timeout: float = 10.0, verbose: bool = False) -> bytes:
     """Initiator side of one proximity encounter. Returns the token received back from the peer."""
     peer_record = trust_store.get_peer(peer_id)
     if peer_record is None:
@@ -143,17 +143,30 @@ def initiate_encounter(transport, my_identity: Identity, trust_store: TrustStore
     pq_secret = ephemeral_pq.decapsulate(response["kem_ciphertext"])
     shared_x = derive_shared_secret(ephemeral_x_priv, response["ephemeral_x_pub"])
     session_key = combine_secrets(shared_x, pq_secret, info=PROXIMITY_INFO)
+    if verbose:
+        tag = my_identity.device_id
+        print(f"[{tag}] X25519 ephemeral shared secret: {shared_x.hex()}")
+        print(f"[{tag}] ML-KEM-768 shared secret:        {pq_secret.hex()}")
+        print(f"[{tag}] combined session key (HKDF-SHA256, {len(session_key)*8}-bit): {session_key.hex()}")
 
     nonce, ciphertext = ascon_encrypt(session_key, token)
+    if verbose:
+        print(f"[{tag}] encrypting message {token!r} with ASCON-128a")
+        print(f"[{tag}]   nonce:      {nonce.hex()}")
+        print(f"[{tag}]   ciphertext: {ciphertext.hex()}")
     transport.send(peer_id, pack_token(nonce, ciphertext))
 
     _sender, raw_token = transport.receive(timeout=timeout)
     peer_nonce, peer_ciphertext = unpack_token(raw_token)
-    return ascon_decrypt(session_key, peer_nonce, peer_ciphertext)
+    plaintext = ascon_decrypt(session_key, peer_nonce, peer_ciphertext)
+    if verbose:
+        print(f"[{tag}] received ciphertext from {peer_id}: {peer_ciphertext.hex()} (nonce {peer_nonce.hex()})")
+        print(f"[{tag}] decrypted plaintext: {plaintext!r}")
+    return plaintext
 
 
 def respond_to_encounter(transport, my_identity: Identity, trust_store: TrustStore, token: bytes,
-                          timeout: float = 10.0) -> tuple[str, bytes]:
+                          timeout: float = 10.0, verbose: bool = False) -> tuple[str, bytes]:
     """Responder side: waits for one INITIATE message and completes the handshake + token
     exchange. Returns (peer_id, token_received_from_initiator). Raises UnpairedPeerError or
     AuthenticationFailedError (without ever sending a response) if the peer isn't legitimately
@@ -174,14 +187,26 @@ def respond_to_encounter(transport, my_identity: Identity, trust_store: TrustSto
     kem_ciphertext, pq_secret = encapsulate(initiate["ephemeral_pq_pub"])
     shared_x = derive_shared_secret(ephemeral_x_priv, initiate["ephemeral_x_pub"])
     session_key = combine_secrets(shared_x, pq_secret, info=PROXIMITY_INFO)
+    if verbose:
+        tag = my_identity.device_id
+        print(f"[{tag}] X25519 ephemeral shared secret: {shared_x.hex()}")
+        print(f"[{tag}] ML-KEM-768 shared secret:        {pq_secret.hex()}")
+        print(f"[{tag}] combined session key (HKDF-SHA256, {len(session_key)*8}-bit): {session_key.hex()}")
 
     transport.send(initiate["device_id"], build_response_message(my_identity, ephemeral_x_pub, kem_ciphertext, long_term_key))
 
     _sender, raw_token = transport.receive(timeout=timeout)
     peer_nonce, peer_ciphertext = unpack_token(raw_token)
     received_token = ascon_decrypt(session_key, peer_nonce, peer_ciphertext)
+    if verbose:
+        print(f"[{tag}] received ciphertext from {initiate['device_id']}: {peer_ciphertext.hex()} (nonce {peer_nonce.hex()})")
+        print(f"[{tag}] decrypted plaintext: {received_token!r}")
 
     nonce, ciphertext = ascon_encrypt(session_key, token)
+    if verbose:
+        print(f"[{tag}] encrypting reply {token!r} with ASCON-128a")
+        print(f"[{tag}]   nonce:      {nonce.hex()}")
+        print(f"[{tag}]   ciphertext: {ciphertext.hex()}")
     transport.send(initiate["device_id"], pack_token(nonce, ciphertext))
 
     return initiate["device_id"], received_token
