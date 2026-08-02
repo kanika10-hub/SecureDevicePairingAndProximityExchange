@@ -1,6 +1,7 @@
 """Shared helpers for demo/device_a.py and demo/device_b.py: per-device state paths and the
 tiny length-framed socket helpers used only during --pair (proximity uses transport_wifi.py /
 transport_ble.py instead, which have their own framing)."""
+import os
 import socket
 import struct
 import time
@@ -50,6 +51,13 @@ def make_transport(name: str):
 
         return BleTransport()
     raise ValueError(f"unknown transport: {name}")
+
+
+def resolve_passphrase(cli_value: str | None) -> str | None:
+    """`--passphrase` on the command line wins; falls back to the `DEVICE_PASSPHRASE` env var
+    (so you don't have to retype it, or leave it in shell history, on every command); `None`
+    (no at-rest encryption -- the original behavior) if neither is set."""
+    return cli_value or os.environ.get("DEVICE_PASSPHRASE") or None
 
 
 def make_trust_manager(state_dir: Path):

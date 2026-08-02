@@ -23,20 +23,40 @@ and demo/device_b.py wire it up over an actual socket.
 """
 import hashlib
 import json
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.ascon_aead import KEY_SIZE as ASCON_KEY_SIZE
 from core.ascon_aead import decrypt as ascon_decrypt
 from core.ascon_aead import encrypt as ascon_encrypt
 from core.classical_kex import derive_shared_secret, generate_keypair as generate_x25519_keypair
 from core.hybrid import combine_secrets
 from core.pq_kex import encapsulate, generate_keypair as generate_pq_keypair, load_keypair as load_pq_keypair
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 from pairing.qr_generate import build_payload, parse_payload
 
 PAIRING_INFO = b"pairing-handshake"
+
+# Scrypt cost parameters for identity-file passphrase encryption. N=2**14 costs ~100ms on
+# ordinary hardware -- enough to make offline passphrase guessing expensive without making
+# every `load_or_create_identity` call noticeably slow.
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_SALT_SIZE = 16
+
+
+class WrongPassphraseError(Exception):
+    """Raised when an identity file is passphrase-encrypted and the given passphrase can't
+    decrypt it (wrong passphrase, or the file was tampered with/corrupted)."""
+
+
+def _derive_identity_key(passphrase: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    return Scrypt(salt=salt, length=ASCON_KEY_SIZE, n=n, r=r, p=p).derive(passphrase.encode("utf-8"))
 
 
 @dataclass
@@ -57,37 +77,90 @@ def generate_identity(device_id: str) -> Identity:
     return Identity(device_id, x25519_priv, x25519_pub, pq_keypair)
 
 
-def save_identity(identity: Identity, path: str | Path):
-    x25519_priv_raw = identity.x25519_priv.private_bytes(
-        Encoding.Raw, PrivateFormat.Raw, NoEncryption()
-    )
+def save_identity(identity: Identity, path: str | Path, passphrase: str | None = None):
+    """Save an identity to disk. If `passphrase` is given, the private key material (only) is
+    encrypted at rest with a Scrypt-derived key under ASCON-128a, bound via associated data to
+    the device_id and public keys so the ciphertext can't be swapped onto a different identity's
+    public half. `device_id` and both public keys stay in cleartext either way -- they aren't
+    secret, and the pairing/proximity protocols need to read them without a passphrase.
+
+    Without a passphrase, saves in the original plaintext format (default, for backward
+    compatibility with existing identity files and non-interactive use)."""
+    x25519_priv_raw = identity.x25519_priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    private_fields = {
+        "x25519_priv": x25519_priv_raw.hex(),
+        "mlkem_priv": identity.pq_keypair.export_secret_key().hex(),
+    }
     data = {
         "device_id": identity.device_id,
-        "x25519_priv": x25519_priv_raw.hex(),
         "x25519_pub": identity.x25519_pub.hex(),
-        "mlkem_priv": identity.pq_keypair.export_secret_key().hex(),
         "mlkem_pub": identity.pq_keypair.public_key.hex(),
     }
+
+    if passphrase:
+        salt = os.urandom(SCRYPT_SALT_SIZE)
+        key = _derive_identity_key(passphrase, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+        associated_data = identity.device_id.encode("utf-8") + identity.x25519_pub + identity.pq_keypair.public_key
+        nonce, ciphertext = ascon_encrypt(key, json.dumps(private_fields).encode("utf-8"), associated_data=associated_data)
+        data.update({
+            "encrypted": True,
+            "kdf": "scrypt", "kdf_salt": salt.hex(), "kdf_n": SCRYPT_N, "kdf_r": SCRYPT_R, "kdf_p": SCRYPT_P,
+            "nonce": nonce.hex(), "ciphertext": ciphertext.hex(),
+        })
+    else:
+        data["encrypted"] = False
+        data.update(private_fields)
+
     Path(path).write_text(json.dumps(data))
 
 
-def load_identity(path: str | Path) -> Identity | None:
+def load_identity(path: str | Path, passphrase: str | None = None) -> Identity | None:
     p = Path(path)
     if not p.exists():
         return None
     data = json.loads(p.read_text())
-    x25519_priv = X25519PrivateKey.from_private_bytes(bytes.fromhex(data["x25519_priv"]))
-    pq_keypair = load_pq_keypair(bytes.fromhex(data["mlkem_priv"]), bytes.fromhex(data["mlkem_pub"]))
-    return Identity(data["device_id"], x25519_priv, bytes.fromhex(data["x25519_pub"]), pq_keypair)
+    x25519_pub = bytes.fromhex(data["x25519_pub"])
+    mlkem_pub = bytes.fromhex(data["mlkem_pub"])
+
+    if data.get("encrypted"):
+        if not passphrase:
+            raise WrongPassphraseError(f"{path} is passphrase-encrypted -- pass a passphrase to load it")
+        salt = bytes.fromhex(data["kdf_salt"])
+        key = _derive_identity_key(passphrase, salt, data["kdf_n"], data["kdf_r"], data["kdf_p"])
+        associated_data = data["device_id"].encode("utf-8") + x25519_pub + mlkem_pub
+        try:
+            plaintext = ascon_decrypt(key, bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"]),
+                                       associated_data=associated_data)
+        except ValueError:
+            raise WrongPassphraseError("wrong passphrase, or identity file is corrupted/tampered with") from None
+        private_fields = json.loads(plaintext)
+    else:
+        private_fields = data
+
+    x25519_priv = X25519PrivateKey.from_private_bytes(bytes.fromhex(private_fields["x25519_priv"]))
+    pq_keypair = load_pq_keypair(bytes.fromhex(private_fields["mlkem_priv"]), mlkem_pub)
+    return Identity(data["device_id"], x25519_priv, x25519_pub, pq_keypair)
 
 
-def load_or_create_identity(device_id: str, path: str | Path) -> Identity:
-    identity = load_identity(path)
-    if identity is not None:
+def load_or_create_identity(device_id: str, path: str | Path, passphrase: str | None = None) -> Identity:
+    """Load the identity at `path`, creating it if absent. If `passphrase` is given and an
+    existing identity at `path` is still in the old plaintext format, it's transparently
+    upgraded in place to passphrase-encrypted on this call -- mirroring how
+    `demo.common.make_trust_manager` migrates the legacy trust store, so turning encryption on
+    doesn't require deleting and re-pairing."""
+    p = Path(path)
+    if not p.exists():
+        identity = generate_identity(device_id)
+        save_identity(identity, path, passphrase=passphrase)
         return identity
-    identity = generate_identity(device_id)
-    save_identity(identity, path)
-    return identity
+
+    data = json.loads(p.read_text())
+    if passphrase and not data.get("encrypted"):
+        identity = load_identity(path)
+        save_identity(identity, path, passphrase=passphrase)
+        return identity
+
+    return load_identity(path, passphrase=passphrase)
 
 
 def compute_fingerprint(id_a: str, x25519_pub_a: bytes, mlkem_pub_a: bytes,
