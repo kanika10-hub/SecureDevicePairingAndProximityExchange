@@ -1,0 +1,317 @@
+================================================================================
+  SECURE DEVICE PAIRING AND PROXIMITY EXCHANGE — HOW TO TEST (STEP BY STEP)
+================================================================================
+
+PROJECT SUMMARY
+---------------
+This project lets two devices pair once using a QR code (out-of-band, so a
+network attacker cannot intercept the keys), then automatically reconnect
+securely whenever they are nearby (over WiFi or BLE). Every reconnect uses
+fresh ephemeral keys authenticated against the long-term trust from pairing.
+
+Crypto used:
+  - Hybrid X25519 + ML-KEM-768 key exchange  (classical + post-quantum)
+  - ASCON-128a AEAD for encryption           (lightweight, NIST-standardized)
+  - HKDF-SHA256 to combine the two secrets into one session key
+
+New features added on top of the original repo:
+  1. Trust management — revoke / restore a paired device
+  2. Custom messages + verbose mode — watch encryption happen live
+  3. Passphrase-encrypted identity.json — private keys protected at rest
+
+================================================================================
+PART 0 — PREREQUISITES
+================================================================================
+
+  Software needed:
+    - Python 3.11 or newer
+    - cmake  (required to build the post-quantum crypto library liboqs from C)
+    - A C compiler reachable on PATH  (gcc, clang, or MSVC via Visual Studio)
+    - On Windows: Microsoft Visual C++ 2013 Redistributable (x64)
+        Install with:  winget install --id Microsoft.VCRedist.2013.x64 -e
+
+  All commands below are run from the repo root directory:
+    C:\Users\P VIKRAM KISHORE\Desktop\crypto\SecureDevicePairingAndProximityExchange\
+
+================================================================================
+PART 1 — ENVIRONMENT SETUP  (do this once)
+================================================================================
+
+  STEP 1.  Create a Python virtual environment
+
+    python -m venv venv
+
+  STEP 2.  Activate the virtual environment
+
+    On Windows:
+      venv\Scripts\activate
+
+    On Linux / macOS:
+      source venv/bin/activate
+
+    You will see (venv) appear at the start of your prompt.
+
+  STEP 3.  Install all dependencies
+
+    pip install -r requirements.txt
+
+    NOTE: liboqs-python builds the liboqs C library from source during this
+    step. It takes several minutes and prints a lot of cmake output — that is
+    normal. If it fails on Windows because your repo and %TEMP% are on
+    different drives, build liboqs manually first:
+
+      cmake --build liboqs/build --parallel 4
+      cmake --build liboqs/build --target install
+
+================================================================================
+PART 2 — RUN THE AUTOMATED TEST SUITE
+================================================================================
+
+  STEP 4.  Run all tests (except the BLE test, which is broken on Windows)
+
+    pytest tests/ -q --ignore=tests/test_transport_ble.py
+
+    Expected output:
+      - 120+ tests collected
+      - All PASSED (no failures, some skipped is fine)
+      - Total time: roughly 30–60 seconds
+
+    What each test file covers:
+      test_ascon_aead.py        — ASCON-128a encryption / decryption / tag verification
+      test_classical_kex.py     — X25519 key generation and Diffie-Hellman
+      test_pq_kex.py            — ML-KEM-768 key generation, encapsulation, decapsulation
+      test_hybrid.py            — HKDF combiner (classical + PQ → session key)
+      test_pairing_protocol.py  — Full QR pairing handshake end-to-end
+      test_pairing_qr.py        — QR payload encoding / decoding
+      test_proximity_protocol.py— Proximity handshake + rejection of unpaired peers
+      test_transport_wifi.py    — WiFi mDNS transport (real sockets, loopback)
+      test_trust_store.py       — Legacy pairing trust store (read/write)
+      test_trust_framework.py   — Trust lifecycle: register / revoke / restore /
+                                  expire / rotate keys / search / backup (88 tests)
+
+  STEP 5.  Run ONLY the trust framework tests (fast — under 1 second, no network)
+
+    pytest tests/test_trust_framework.py -v
+
+    These 88 tests cover the new trust management module (trust/) in isolation —
+    no crypto, no network, no BLE. They verify:
+      - Registering a device, listing devices
+      - Revoking and restoring trust
+      - Trust expiry (automatic and manual)
+      - Key rotation and key history
+      - Export and import of the trust database
+      - Edge cases: duplicate registration, wrong passphrase, etc.
+
+================================================================================
+PART 3 — DEMO: PAIR TWO DEVICES
+================================================================================
+
+  This demo runs both "devices" on the same machine using localhost.
+  You need TWO terminal windows, both with (venv) activated, both in the
+  repo root.
+
+  STEP 6.  Terminal 1 — Start Device A (the initiator / QR displayer)
+
+    python -m demo.device_a --pair
+
+    Device A will:
+      - Generate a long-term identity (saved to demo/state/device-a/identity.json)
+      - Save a QR code PNG to demo/state/device-a/qr.png
+      - Print a port number and wait for Device B to connect
+
+    Example output:
+      [12:00:01] [device-a] identity ready, QR code saved to ...qr.png
+      [12:00:01] [device-a] listening on port 54321 for device-b's pairing response
+      [12:00:01] [device-a] run: python -m demo.device_b --pair --qr-image ... --peer-port 54321
+
+  STEP 7.  Terminal 2 — Start Device B (the scanner / responder)
+           (replace 54321 with the actual port printed by Device A)
+
+    python -m demo.device_b --pair --qr-image demo/state/device-a/qr.png --peer-port 54321
+
+    Device B will:
+      - Read the QR PNG (simulates scanning with a camera)
+      - Run the hybrid X25519 + ML-KEM-768 pairing handshake over TCP
+      - Print a SAFETY NUMBER (fingerprint)
+
+  STEP 8.  Verify the safety numbers match
+
+    Both terminals will print a line like:
+      SAFETY NUMBER (compare with device-b): A1B2-C3D4-E5F6-...
+
+    The number must be IDENTICAL on both sides. This is the same idea as
+    Signal's safety numbers — if they match, neither side was intercepted.
+
+================================================================================
+PART 4 — DEMO: PROXIMITY RECONNECT (after pairing)
+================================================================================
+
+  STEP 9.  Terminal 1 — Start Device B as the responder
+
+    python -m demo.device_b --proximity --transport wifi --duration 30
+
+  STEP 10. Terminal 2 — Start Device A as the initiator
+
+    python -m demo.device_a --proximity --transport wifi
+
+    What happens:
+      - Device A advertises itself over mDNS (WiFi local network discovery)
+      - Device A discovers Device B
+      - They run a fresh ephemeral X25519 + ML-KEM-768 handshake
+      - They authenticate each other using HMAC-SHA256 over a long-term key
+        derived from their original pairing (so only truly paired devices pass)
+      - They encrypt and exchange a token using ASCON-128a
+
+    Expected output on both sides:
+      ACCEPTED device-b: authenticated handshake complete, received token b'...'
+
+================================================================================
+PART 5 — DEMO: REJECTION OF AN UNPAIRED DEVICE
+================================================================================
+
+  (Device B should still be running --proximity in Terminal 1 from Step 9.
+   If not, restart it.)
+
+  STEP 11. Terminal 2 — Simulate a stranger trying to connect
+
+    python -m demo.device_a --proximity --transport wifi --as-stranger
+
+    What happens:
+      - Device A generates a brand-new identity that was never paired with Device B
+      - It tries to initiate a proximity encounter
+      - Its own trust store is empty, so it logs SKIPPED before even contacting B
+
+    Expected output:
+      SKIPPED stranger-XXXXXXXX: stranger-XXXXXXXX is not a paired device
+
+    This proves the system rejects unknown devices — it will not even attempt
+    a connection without a prior pairing record.
+
+================================================================================
+PART 6 — DEMO: TRUST MANAGEMENT (NEW FEATURE — revoke / restore)
+================================================================================
+
+  STEP 12. List Device A's paired peers and their trust status
+
+    python -m demo.trust_cli device-a --list
+
+    Output shows device-b listed as TRUSTED.
+
+  STEP 13. Revoke Device B's trust
+
+    python -m demo.trust_cli device-a --revoke device-b --reason "lost device"
+
+  STEP 14. Try proximity again — Device B is now rejected
+
+    Terminal 1:  python -m demo.device_b --proximity --transport wifi --duration 30
+    Terminal 2:  python -m demo.device_a --proximity --transport wifi
+
+    Expected output on Device A's terminal:
+      SKIPPED device-b: device-b is not a paired device
+
+    Note: a revoked device is deliberately indistinguishable from an unpaired
+    stranger on the wire (the exact same error message), so an attacker cannot
+    learn that their device was specifically revoked.
+
+  STEP 15. Restore Device B's trust
+
+    python -m demo.trust_cli device-a --restore device-b
+
+  STEP 16. Run proximity again — Device B is accepted again
+
+    Terminal 1:  python -m demo.device_b --proximity --transport wifi --duration 30
+    Terminal 2:  python -m demo.device_a --proximity --transport wifi
+
+    Expected output:
+      ACCEPTED device-b: authenticated handshake complete, received token b'...'
+
+================================================================================
+PART 7 — DEMO: WATCH ENCRYPTION HAPPEN LIVE (NEW FEATURE — --verbose)
+================================================================================
+
+  STEP 17. Send a custom message and print every crypto step
+
+    Terminal 1:  python -m demo.device_b --proximity --transport wifi --duration 30
+    Terminal 2:  python -m demo.device_a --proximity --transport wifi --verbose --message "hello from device-a"
+
+    The --verbose flag prints:
+      - X25519 ephemeral shared secret   (32 bytes, hex)
+      - ML-KEM-768 shared secret         (32 bytes, hex)
+      - Combined session key (HKDF-SHA256, 128-bit)
+      - ASCON-128a nonce                 (16 bytes, hex)
+      - ASCON-128a ciphertext            (encrypted "hello from device-a")
+      - Decrypted plaintext received from the peer
+
+    This makes the cryptography visible at each step — you can see that the
+    two independently-derived secrets are combined into one session key, and
+    that the message is unreadable in transit (ciphertext) but decrypts
+    correctly on the other side.
+
+================================================================================
+PART 8 — DEMO: ENCRYPTED IDENTITY AT REST (NEW FEATURE — passphrase)
+================================================================================
+
+  NOTE: If you already ran Steps 6–7 (pairing), the identity.json files for
+  device-a and device-b already exist in plaintext. Delete the state directory
+  first to start fresh:
+    rmdir /s /q demo\state      (Windows)
+    rm -rf demo/state           (Linux / macOS)
+
+  STEP 18. Pair with a passphrase — private keys are encrypted at rest
+
+    Terminal 1:
+      python -m demo.device_a --pair --passphrase "my-secret-pass"
+
+    Terminal 2:
+      python -m demo.device_b --pair --qr-image demo/state/device-a/qr.png --peer-port <PORT> --passphrase "my-secret-pass"
+
+    Now open demo/state/device-a/identity.json in a text editor.
+    You will see:
+      "encrypted": true
+      "kdf": "scrypt"
+      "nonce": "..."
+      "ciphertext": "..."      ← private keys are encrypted, not readable
+
+    Without the passphrase the private keys are completely inaccessible.
+
+  STEP 19. Subsequent commands need the same passphrase
+
+    python -m demo.device_a --proximity --transport wifi --passphrase "my-secret-pass"
+
+    Or set it as an environment variable once per session (avoids retyping):
+      On Windows:  $env:DEVICE_PASSPHRASE = "my-secret-pass"
+      On Linux:    export DEVICE_PASSPHRASE="my-secret-pass"
+
+    Then just run:
+      python -m demo.device_a --proximity --transport wifi
+
+================================================================================
+PART 9 — BENCHMARK (optional)
+================================================================================
+
+  STEP 20. Run the WiFi handshake latency benchmark
+
+    python -m benchmarks.run_benchmark
+
+    This runs 20 full proximity handshakes over WiFi (loopback) and measures
+    latency per handshake. Results are written to:
+      benchmarks/results/latency_raw.csv
+      benchmarks/results/latency_comparison.png
+
+    Expected: WiFi averages roughly 5–10 ms per handshake on localhost.
+    BLE is skipped automatically if no Bluetooth adapter is available.
+
+================================================================================
+SUMMARY OF WHAT WAS DEMONSTRATED
+================================================================================
+
+  Test suite   131 automated tests covering every module — all pass
+  Part 3       QR-based pairing: hybrid X25519 + ML-KEM-768 handshake, safety number
+  Part 4       Proximity reconnect: ephemeral handshake, ASCON-128a token exchange
+  Part 5       Stranger rejection: unpaired device is refused before any connection
+  Part 6       Trust revocation: paired device can be revoked and restored at runtime
+  Part 7       Verbose mode: session key, nonce, ciphertext printed at each step
+  Part 8       Passphrase encryption: identity.json stores private keys encrypted
+  Part 9       Benchmark: WiFi handshake latency (~5–10 ms / handshake)
+
+================================================================================

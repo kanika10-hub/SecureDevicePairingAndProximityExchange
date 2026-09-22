@@ -5,7 +5,7 @@ qrcode==8.2
 opencv-python-headless==5.0.0.93
 pyzbar==0.1.9
 bleak==3.0.2
-bless==0.3.0
+# bless==0.3.0  -- broken on Windows (pysetupdi missing + winrt version conflict); BLE not used on Windows
 zeroconf==0.150.0
 pytest==9.1.1
 matplotlib==3.11.1
