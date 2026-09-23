@@ -1,0 +1,444 @@
+==============================================================
+  SECURE DEVICE PAIRING AND PROXIMITY EXCHANGE
+  How to explain this project from scratch — no jargon
+==============================================================
+
+
+THE ONE-SENTENCE VERSION
+-------------------------
+We built a system where two devices can meet, identify each other securely,
+and then talk privately every time they come near — protected against hackers,
+protected against future quantum computers, and with a live website that shows
+every single step happening in real time.
+
+
+THE REAL-WORLD PROBLEM WE ARE SOLVING
+---------------------------------------
+Imagine your phone needs to talk to your laptop privately.
+If they just connect over WiFi and share a secret code, a hacker sitting
+on the same network could:
+  - Pretend to be the laptop (your phone ends up talking to the hacker)
+  - Record everything now and decode it later using a future supercomputer
+
+Before this project, most pairing systems also had no "off switch" — once
+two devices trusted each other, that trust lasted forever. Lose a device?
+Tough luck.
+
+We solved all three of these problems:
+  Problem 1 → Man-in-the-middle attack (hacker in the middle, intercepting)
+  Problem 2 → Quantum computer attack (future computers breaking encryption)
+  Problem 3 → No revocation (no way to cut off a device that was lost/stolen)
+
+
+==============================================================
+  THE METHODOLOGY — HOW WE ACTUALLY BUILT IT
+==============================================================
+
+We split the project into four layers, built one on top of the other:
+
+  LAYER 1: CRYPTO CORE (the engine room)
+  LAYER 2: PAIRING (first-time handshake)
+  LAYER 3: PROXIMITY (every-time reconnect)
+  LAYER 4: TRUST MANAGEMENT (the on/off switch)
+  +  WEBSITE: live visualizer that shows all of the above happening
+
+Each layer is independent — you can test Layer 1 without touching Layer 4.
+This is important because it means bugs in trust management cannot corrupt
+the cryptographic primitives, and vice versa.
+
+
+==============================================================
+  LAYER 1: THE CRYPTO CORE  (Vikram built this — core/ folder)
+==============================================================
+
+Think of this as the tool box. Before anything else can work, we need
+tools to make secrets and lock messages. We built four:
+
+TOOL 1: X25519  (the classical secret-maker)
+  Two people, Alice and Bob, each have a secret number.
+  They each mix their secret into a shared public colour.
+  They swap the mixed colours.
+  They each add their own secret back in.
+  They end up with the same final colour — but no one watching can figure
+  it out, because reversing the mixing is mathematically impossible.
+  This is called "Diffie-Hellman" and it lets two devices agree on a shared
+  secret without ever saying the secret out loud.
+
+  Limitation: A quantum computer (future technology) can reverse this maths.
+
+TOOL 2: ML-KEM-768  (the quantum-proof secret-maker)
+  This is a brand-new type of maths (standardised by the US government's
+  NIST institute in August 2024, called FIPS 203) based on lattice problems
+  which even quantum computers cannot solve efficiently.
+  Works like a padlock that only the key-holder can open — but quantum-safe.
+
+TOOL 3: HKDF-SHA256  (the mixer)
+  After Tool 1 and Tool 2 each produce a secret number, we need to turn
+  two numbers into one single session key.
+  HKDF is a standard recipe (like a blender) for combining secrets safely.
+  You cannot reverse it to find the original inputs.
+
+TOOL 4: ASCON-128a  (the actual lock and key)
+  Once we have a session key, we use it to lock messages.
+  ASCON-128a won the NIST Lightweight Cryptography competition (2023) and
+  is the official standard for small/constrained devices (IoT, Bluetooth,
+  phones). It:
+    - Encrypts so no one can read it without the key
+    - Adds a tamper-detection tag so we know if anyone changed the message
+    - Uses very little memory (designed for chips with tiny RAM)
+  Chosen over AES because AES requires hardware acceleration chips that
+  small IoT devices may not have. ASCON works purely in software on anything.
+
+WHY USE BOTH X25519 AND ML-KEM?
+  If we only used X25519, a quantum computer in 2040 could break everything.
+  If we only used ML-KEM, we'd be relying on brand-new unproven maths.
+  Using BOTH means an attacker must break TWO completely different systems
+  simultaneously. Even if quantum computers break X25519, ML-KEM still holds.
+  This pattern is called "hybrid cryptography" — Signal and Apple iMessage
+  both use the same idea.
+
+
+==============================================================
+  LAYER 2: PAIRING  (Vikram built this — pairing/ folder)
+==============================================================
+
+This is the "first handshake" — how two devices meet for the first time.
+The challenge: how does Device A know it's talking to the real Device B,
+and not to a hacker pretending to be Device B?
+
+Our answer: the QR code is the proof.
+
+STEP-BY-STEP FLOW:
+
+  Step 1 — Device A generates its long-term identity
+    Using Tools 1 and 2 (X25519 + ML-KEM), Device A creates two keypairs:
+    a classical one and a quantum-proof one. The private keys NEVER leave
+    Device A. The public keys are like a padlock anyone can use to seal a
+    message, but only Device A's private key can open it.
+
+  Step 2 — Device A encodes its public keys into a QR code
+    The QR code contains: Device A's name + its X25519 public key +
+    its ML-KEM public key.
+    WHY QR? A hacker sitting on the WiFi network CANNOT see a QR code.
+    They would have to be physically present and looking at your screen.
+    This "out-of-band channel" (a channel separate from the network) is what
+    stops the man-in-the-middle attack. The hacker can intercept network
+    packets but cannot intercept a QR scan.
+
+  Step 3 — Device B scans the QR
+    Device B now knows Device A's public padlock. It uses it to:
+      a) Do X25519 DH with Device A's public key and its own new keypair
+      b) Use ML-KEM to seal a random post-quantum secret inside Device A's
+         padlock (only Device A can open this)
+      c) Combine both secrets using HKDF → session key
+      d) Encrypt its own public keys using ASCON under that session key
+      e) Send the result back to Device A over the network
+
+    The network sees encrypted data and a sealed envelope. Neither gives
+    away the session key because only Device A can open the padlock.
+
+  Step 4 — Device A responds
+    Device A receives the message and:
+      a) Decapsulates the ML-KEM sealed envelope (uses its private key)
+      b) Completes the X25519 DH
+      c) Combines the same two secrets → arrives at the SAME session key
+      d) Decrypts Device B's public keys
+    No network attacker can do this — they don't have Device A's private key.
+
+  Step 5 — Fingerprint comparison (human check)
+    Both devices independently compute a "safety number" — a short code
+    derived from BOTH devices' combined public keys.
+    They read it out loud: "My number is 3A9F-21BC..."
+    If both say the same number, the exchange was not tampered with.
+    This is exactly how Signal messenger's "safety number" works.
+
+  Step 6 — Trust record saved
+    Both devices write down: "I now trust this peer with these public keys."
+    This file (identity.json) can optionally be passphrase-protected:
+    passphrase → Scrypt (slow hashing) → ASCON encryption → private keys safe.
+
+
+==============================================================
+  LAYER 3: PROXIMITY  (Kanika built this — proximity/ folder)
+==============================================================
+
+After the first pairing, we don't want to scan a QR code every single time
+the devices meet. Proximity handles automatic secure reconnection.
+
+Every time Device A and Device B come near each other (on the same WiFi
+network, or within BLE Bluetooth range):
+
+  Step 1 — Device A generates FRESH one-time keys
+    Brand new X25519 and ML-KEM keypairs, just for this one encounter.
+    These are thrown away immediately after the session ends.
+    WHY? This is called "forward secrecy" — if someone records this
+    conversation and later steals Device A's long-term keys, they STILL
+    cannot decrypt this conversation, because the one-time keys no longer
+    exist anywhere.
+
+  Step 2 — Device A signs those fresh keys with a MAC
+    MAC = Message Authentication Code.
+    Think of it as a stamp that only someone who was at the original QR
+    pairing could have made.
+    How: Device A computes DH between its LONG-TERM private key and Device B's
+    long-term public key. This gives a value that only Device A can compute
+    (because only Device A has its long-term private key). That value becomes
+    the MAC key. Device A stamps its fresh one-time keys with this MAC.
+
+  Step 3 — Device A sends the stamped message to Device B
+    Message = [Device A's name] + [one-time X25519 public] +
+              [one-time ML-KEM public] + [MAC stamp]
+
+  Step 4 — Device B verifies the stamp
+    Device B checks its trust record. Is "Device A" in there?
+    If NO → silent rejection. No response. The stranger gets nothing.
+    If YES → Device B computes the same MAC key from its own long-term keys.
+             It checks if the stamp matches. If yes, it's confirmed: this IS
+             Device A (only Device A could produce this stamp).
+    IMPORTANT: A hacker claiming to be Device A cannot fake this stamp
+    without having Device A's long-term private key. The original pairing
+    keys are what authenticate every future reconnect.
+
+  Step 5 — Device B responds and establishes session key
+    Device B generates its own one-time keys, does X25519 DH + ML-KEM
+    encapsulation → both sides independently arrive at the SAME fresh session
+    key. Messages are encrypted with ASCON and exchanged.
+
+  TRANSPORTS (how they find each other):
+    WiFi: Device B advertises itself using mDNS (like a local DNS broadcast).
+          Device A discovers it and connects via TCP socket.
+          TESTED LIVE end-to-end. Average handshake: ~6 milliseconds.
+    BLE:  (Bluetooth Low Energy) Device B advertises a GATT service.
+          Device A scans and connects.
+          Built and unit-tested. Not live-tested (no Bluetooth hardware
+          available in the dev environment).
+
+
+==============================================================
+  LAYER 4: TRUST MANAGEMENT  (Kanika built this — trust/ folder)
+==============================================================
+
+After pairing, devices are stored in a "trust database." Kanika built
+a full lifecycle management system around this database.
+
+Before this was built: the only way to "unpair" a device was to manually
+delete a line from a JSON file. There was no off switch.
+
+Now there are three trust states:
+  TRUSTED  → device is active, handshakes allowed
+  REVOKED  → manually switched off (e.g. "this phone was stolen")
+  EXPIRED  → time-based cutoff (e.g. "this device should only be trusted
+              for 30 days")
+
+KEY OPERATIONS:
+  Register   → add a device after pairing
+  Revoke     → cut off a device (reversible, can restore later)
+  Restore    → bring it back
+  Expire     → time-based cutoff with optional deadline
+  Rotate key → if a device re-pairs (got a new keypair), record the new
+                keys and archive the old ones with a timestamp
+  Search     → find devices by name, fingerprint, or status
+  Export     → back up the entire trust database to a portable file
+  Import     → restore it on a new machine
+
+SECURITY DETAIL ON REVOCATION:
+  A revoked device is rejected with the EXACT SAME message as a stranger
+  who was never paired at all. This is deliberate. If we said "access denied
+  — your device was revoked," we would tell an attacker they were specifically
+  revoked and that their device ID is known. Saying nothing leaks nothing.
+
+COMMAND TO REVOKE:
+  python -m demo.trust_cli device-a --revoke device-b --reason "lost phone"
+  python -m demo.trust_cli device-a --restore device-b
+
+
+==============================================================
+  THE WEBSITE (Kanika built this — website/ folder)
+==============================================================
+
+An interactive website that makes the invisible visible.
+
+Open your browser. Click "Pair Fresh." Watch every step appear in real time:
+  - The actual X25519 public keys (64-character hex strings)
+  - The actual ML-KEM ciphertext (2176-character hex string)
+  - The HKDF session key as it's derived
+  - The ASCON nonce and ciphertext for each message
+  - The fingerprint that both devices compute independently
+
+Nothing is simulated. The server performs the REAL cryptographic operations
+and streams each step to the browser as it happens.
+
+HOW THE WEBSITE WORKS:
+  1. Python FastAPI server runs on port 8000
+  2. When you click a button, it sends a command to the server
+  3. The server runs the actual crypto (using the same code as the CLI demo)
+  4. After each step, it sends the result to your browser via WebSocket
+     (WebSocket = a live connection, like a phone call between server and
+      browser, so updates appear instantly without page refresh)
+  5. The browser displays each step as a card with the real hex values
+
+THREE SCENARIOS YOU CAN SEE LIVE:
+  "Pair Fresh"       → Watch two devices pair from scratch using QR
+  "Reconnect"        → Watch them reconnect with fresh ephemeral keys
+  "Stranger Attack"  → Watch an unknown device attempt to connect and
+                        get silently rejected — the fake MAC is shown in red
+
+There is also a React version (in the ui/ folder) with a more polished
+interface, running on port 3000, that proxies its API calls to the same
+Python server on port 8000.
+
+
+==============================================================
+  WHAT VIKRAM AND KANIKA BUILT TOGETHER
+==============================================================
+
+1. END-TO-END INTEGRATION
+   Vikram's pairing layer and Kanika's proximity layer had to connect.
+   Device A (device_a.py) and Device B (device_b.py) are the CLI programs
+   that wire everything together: they call pairing, save the trust record,
+   then use the proximity protocol for every reconnect.
+
+2. DOCUMENTATION
+   README explains the whole system. README_V2 adds Windows-specific setup
+   notes (three real installation problems found on Windows, each with a fix).
+   SECURITY_ANALYSIS.md is an honest analysis of what IS and IS NOT protected.
+
+3. IDENTITY ENCRYPTION
+   identity.json stores private keys. Kanika added optional passphrase
+   protection: the passphrase is put through Scrypt (a deliberately slow
+   hashing function — makes brute-force guessing take years instead of
+   seconds) and the result encrypts the private keys with ASCON.
+   If you forget the passphrase, keys are unrecoverable. That is the point.
+
+4. TEST SUITE
+   131 automated tests total. These run every time the code changes and
+   catch regressions. They cover:
+     - Each crypto primitive individually (encrypt, decrypt, tamper detection)
+     - The full pairing handshake (including what happens if keys don't match)
+     - Proximity reconnect (accepted, rejected stranger, bad MAC)
+     - All 88 trust lifecycle operations (register, revoke, restore, expire,
+       rotate, search, backup/import)
+
+
+==============================================================
+  OUTPUTS / HOW WE MEASURE SUCCESS
+==============================================================
+
+This is a security engineering project, not a machine learning project.
+The relevant outputs are security properties and performance metrics:
+
+SECURITY PROPERTIES (verified by design and by tests):
+
+  Property 1 — MITM Resistance
+    Measurement: 0 successful man-in-the-middle attacks in tests.
+    Why it holds: The QR carries Device A's public keys out-of-band.
+    A network attacker never sees them, so cannot derive the session key.
+    Test: tests/test_pairing_protocol.py
+
+  Property 2 — Quantum Resistance
+    Measurement: Session key requires breaking BOTH X25519 AND ML-KEM-768.
+    ML-KEM-768 targets NIST Security Level 3 (128-bit post-quantum security).
+    Breaking either one alone is NOT sufficient.
+
+  Property 3 — Forward Secrecy
+    Measurement: 0 past sessions can be decrypted even if long-term keys leak.
+    Why: Every proximity session uses br
+    and-new one-time ephemeral keys,
+    discarded immediately after. Those keys are never written to disk.
+    Test: tests/test_proximity_protocol.py
+
+  Property 4 — Tamper Detection Rate: 100%
+    Measurement: Every single modified-ciphertext test raises an error.
+    ASCON's authentication tag detects even a 1-bit change.
+    Test: tests/test_ascon_aead.py — test_tampered_ciphertext_rejected,
+                                      test_tampered_nonce_rejected
+
+  Property 5 — Stranger Rejection Rate: 100%
+    Measurement: Every unpaired device attempting handshake is rejected.
+    Mechanism: HMAC verification fails → exception raised before any response
+    Test: tests/test_proximity_protocol.py — test_responder_rejects_stranger,
+           test_responder_rejects_impersonator_with_wrong_long_term_key
+
+  Property 6 — Revocation Effectiveness
+    Measurement: 100% of revoked devices rejected at session gate.
+    Trust policy evaluated BEFORE crypto operations begin.
+
+PERFORMANCE METRICS:
+
+  WiFi handshake latency: ~6 ms average (measured live over 20 runs)
+  This includes: ML-KEM encapsulation + decapsulation + X25519 DH + HKDF +
+                 ASCON encrypt/decrypt + TCP round-trip on localhost.
+
+  BLE latency: Not measured live (no hardware available).
+               Tests mocked. Would be higher due to BLE protocol overhead.
+
+TEST COVERAGE:
+  131 tests total
+  - 43 crypto/pairing/proximity tests (all pass)
+  - 88 trust framework tests (all pass in < 0.5 seconds, no network/crypto needed)
+  Windows note: BLE tests skipped on Windows due to library bug (bless/pysetupdi).
+  Run with: pytest tests/ -q --ignore=tests/test_transport_ble.py
+
+
+==============================================================
+  THE SIMPLE VERSION TO SAY OUT LOUD
+==============================================================
+
+"We built a security system for two devices to pair and talk privately.
+
+The first time they meet, one device shows a QR code. The other scans it.
+The QR is physical — a hacker on the network can't see it — so no one can
+intercept that first exchange. Both devices then independently calculate the
+same secret key without ever saying it out loud (that's Diffie-Hellman maths).
+We added a second layer on top using new government-standardised maths that
+even quantum computers can't break, so the system is safe for the future too.
+
+After that first meeting, the devices recognise each other automatically
+whenever they're nearby, using a digital stamp that only a device that
+completed the original QR scan can produce. Fresh session keys are generated
+every single time and thrown away after, so past conversations stay safe even
+if something is later compromised.
+
+We also built a trust management system so you can revoke a device instantly
+if it's lost or stolen — like cancelling a key card. And a live website that
+shows every single step of the encryption process happening in real time,
+with the actual hex values of the keys and ciphertext.
+
+In terms of results: every tampered message is detected, every unpaired or
+revoked device is rejected, and a full WiFi handshake takes about 6 milliseconds."
+
+
+==============================================================
+  WHO BUILT WHAT (SLIDE 20 IN THE PRESENTATION)
+==============================================================
+
+VIKRAM:
+  - Protocol design and threat model
+    Mapped out all attack scenarios before writing code. Documented what
+    the system protects against and what it doesn't.
+  - core/ folder — all four crypto primitives (X25519, ML-KEM-768,
+    HKDF-SHA256, ASCON-128a)
+  - pairing/ folder — identity generation, QR encoding, pairing handshake,
+    fingerprint verification
+  - MITM attack analysis and the SECURITY_ANALYSIS.md document
+
+KANIKA:
+  - proximity/ folder — ephemeral key reconnect, MAC authentication,
+    WiFi and BLE transport
+  - Trust store, device recognition and stranger-attack rejection
+    (the revoke/restore system and the trust lifecycle framework)
+  - website/ folder — FastAPI server + WebSocket backend + live visualizer
+  - Testing of attack scenarios (tampered messages, stranger rejection,
+    reconnect, impersonation)
+
+TOGETHER:
+  - Integration of the full pairing flow end-to-end (device_a.py, device_b.py)
+  - End-to-end testing (131 tests total)
+  - Documentation (README, README_V2, SECURITY_ANALYSIS.md)
+  - Identity encryption at rest (Scrypt + ASCON passphrase protection)
+  - This presentation
+
+==============================================================
+  END
+=================================================
+=============

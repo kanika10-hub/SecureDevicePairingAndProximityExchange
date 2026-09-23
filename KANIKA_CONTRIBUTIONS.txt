@@ -1,0 +1,574 @@
+================================================================
+  KANIKA'S CONTRIBUTIONS — HOW I CODED IT
+  What I built, how I built it, which files, and why each decision
+================================================================
+
+
+OVERVIEW
+--------
+My work covers four distinct areas of the system:
+  1. proximity/ — how paired devices find and authenticate each other again
+  2. trust/      — the full device lifecycle (revoke, expire, rotate, search)
+  3. website/    — the FastAPI backend and live browser visualizer
+  4. tests/      — attack-scenario tests that prove the security properties work
+
+
+================================================================
+  1. PROXIMITY FOLDER — Ephemeral Key Reconnect + MAC Authentication
+================================================================
+
+The challenge: after pairing (Vikram's QR flow), the two devices need to
+recognise each other every time they come within WiFi or BLE range — without
+scanning a QR code again. But any device could claim to be a paired peer.
+I had to make that recognition impossible to fake.
+
+--- THE DESIGN DECISION: ABSTRACT TRANSPORT ---
+
+File: proximity/transport_base.py
+
+Before writing a single byte of WiFi or BLE code, I defined an interface
+(an Abstract Base Class in Python) that describes what a "transport" must
+be able to do, without saying how:
+
+    class Transport(ABC):
+        def start(self, my_id: str): ...
+        def discover(self, timeout: float = 5.0) -> list[str]: ...
+        def send(self, peer_id: str, data: bytes): ...
+        def receive(self, timeout: float | None = None) -> tuple[str, bytes]: ...
+        def stop(self): ...
+
+WHY? Because the handshake logic (the MAC verification, key derivation)
+should be identical regardless of whether the physical channel is WiFi or
+Bluetooth. By writing the protocol against this abstract interface, the
+protocol code never mentions WiFi or BLE at all. You can swap the transport
+underneath without touching the security logic. The tests use a third
+"LoopbackTransport" built from Python queues — same interface, no hardware
+required.
+
+This is the "Strategy Pattern" from software engineering — the algorithm
+(handshake) is separated from the mechanism (transport).
+
+
+--- WiFi TRANSPORT ---
+
+File: proximity/transport_wifi.py
+Class: WifiTransport(Transport)
+
+How it works, step by step:
+
+  Step 1 — Service Advertisement (mDNS)
+    When a device starts, it registers itself on the local network using
+    mDNS (the same technology that lets "Printer.local" appear on your
+    network automatically). The service name is:
+        {device_id}._secprox._tcp.local.
+    This is done using the `zeroconf` library. Any device on the same WiFi
+    can see this broadcast.
+
+  Step 2 — Service Discovery
+    To find peers, `WifiTransport.discover()` uses a `ServiceBrowser` from
+    zeroconf that listens for `_secprox._tcp.local.` announcements. It
+    returns a list of all device_ids currently visible on the network.
+
+  Step 3 — TCP Socket Server
+    The device also opens a TCP server on a random OS-assigned port. It
+    registers that port number inside the mDNS announcement, so peers know
+    where to connect.
+
+  Step 4 — Message Framing
+    Raw TCP is a byte stream — it doesn't know where one message ends and
+    the next begins. I designed a simple framing protocol:
+        [1 byte: sender_id length]
+        [N bytes: sender_id]
+        [4 bytes big-endian: body length]
+        [M bytes: body]
+    Every message is prefixed with these length headers so the receiver
+    knows exactly how many bytes to read for each field.
+
+  Step 5 — Background Accept Loop
+    A daemon thread (`_accept_loop`) runs permanently, accepting incoming
+    TCP connections. Each connection is handled in its own thread, so
+    multiple peers can connect concurrently without blocking each other.
+
+  Step 6 — Local IP Discovery
+    The `_local_ip()` helper uses a UDP connect trick: it briefly connects
+    a UDP socket to 8.8.8.8:80 (Google DNS, never actually used) and reads
+    which local IP the OS chose. This tells us our own IP without needing
+    to parse network interface lists.
+
+
+--- BLE TRANSPORT ---
+
+File: proximity/transport_ble.py
+Class: BleTransport(Transport)
+
+Bluetooth Low Energy is more complex than WiFi because it uses an
+asynchronous GATT (Generic Attribute Profile) model with roles:
+  - Peripheral (server): advertises services, others connect to it
+  - Central (client): scans for peripherals, connects and reads/writes
+
+I used two Python libraries:
+  - bless: GATT server (peripheral side)
+  - bleak: GATT client (central side)
+
+Both are asyncio-based. Since the rest of the project is synchronous, I
+built a bridge: a permanent asyncio event loop runs in a background thread,
+and all calls cross from synchronous code into it via
+`asyncio.run_coroutine_threadsafe`.
+
+Key implementation details:
+
+  GATT Service Setup:
+    Every BLE device exposes a "Service" (a collection of "Characteristics").
+    I defined:
+        SERVICE_UUID = "3ba0b0f0-8b1a-4b8e-9c6a-0f6f2e6a3b10"
+        CHAR_UUID    = (write characteristic for sending data)
+    When a device starts, it creates a GATT server advertising this service.
+    Any peer that scans will find the device by this UUID.
+
+  Chunking (the BLE MTU problem):
+    BLE has a hard limit on message size — the ATT MTU (Maximum Transmission
+    Unit) caps each packet at roughly 180 bytes. But our handshake messages
+    are over 1000 bytes (the ML-KEM public key alone is 1184 bytes).
+    I solved this by chunking:
+      - CHUNK_SIZE = 180 bytes
+      - Sender: splits the full message into 180-byte chunks, sends each one
+      - The first chunk carries a 4-byte big-endian length header
+      - Receiver (`_on_write` handler): accumulates chunks into `_recv_buffer`
+        until `_recv_total_len` bytes have arrived, then delivers the complete
+        message to the queue
+    This is invisible to the protocol layer above — it sends and receives
+    complete messages just like WiFi.
+
+  Note: BLE is implemented and all unit tests pass with mocked GATT adapters.
+  Live BLE testing was not possible because the `bless` library has a known
+  bug on Windows. The WiFi transport was used for the live demo instead.
+
+
+--- THE PROXIMITY PROTOCOL ---
+
+File: proximity/proximity_protocol.py
+
+This is where the actual security lives. The transports are just pipes; the
+protocol is the logic that runs over those pipes.
+
+THE CORE PROBLEM:
+  Alice needs to prove to Bob that she is genuinely device-a — the same
+  device that originally did the QR pairing. She can't show a QR again.
+  She has to prove it cryptographically, from scratch, using only what was
+  established during that original pairing.
+
+THE SOLUTION: Long-term MAC key:
+  During the QR pairing, Alice and Bob independently compute:
+    long_term_secret = ECDH(alice_long_term_priv, bob_long_term_pub)
+    mac_key = HKDF(long_term_secret)
+  Both sides end up with the same `mac_key`. Nobody else in the world has
+  this key — it comes from private keys that never left the devices.
+
+WIRE MESSAGE FORMAT:
+  Every reconnect attempt carries two messages: INITIATE and RESPONSE.
+
+  INITIATE (Alice → Bob):
+    [1 byte: device_id length]
+    [N bytes: device_id]          ← "I am device-a"
+    [32 bytes: fresh X25519 pub]  ← new ephemeral key (thrown away after)
+    [1184 bytes: fresh ML-KEM pub]← new quantum-safe key (thrown away after)
+    [32 bytes: HMAC]              ← HMAC-SHA256(mac_key, id ∥ x25519 ∥ mlkem)
+
+  RESPONSE (Bob → Alice):
+    [1 byte: device_id length]
+    [N bytes: device_id]
+    [32 bytes: fresh X25519 pub]
+    [1088 bytes: ML-KEM ciphertext]← Bob encapsulated a secret to Alice's key
+    [32 bytes: HMAC]
+
+  TOKEN (final, encrypted):
+    [16 bytes: ASCON nonce]
+    [N bytes: ASCON ciphertext]   ← the actual application payload
+
+HOW AUTHENTICATION WORKS:
+  Bob receives the INITIATE message. He:
+    1. Looks up "device-a" in his trust store.
+    2. If NOT found → UnpairedPeerError (stranger rejection).
+    3. Recomputes the expected HMAC using the mac_key he derived from
+       the original pairing.
+    4. Compares byte-for-byte with the received HMAC.
+    5. If mismatch → AuthenticationFailedError (impersonation rejected).
+    6. If match → proceeds to derive the session key.
+
+  An attacker ("Mallory") who claims to be device-a but doesn't have
+  device-a's original long-term private key CANNOT compute the correct HMAC.
+  She can't even look up what mac_key to use — she'd need device-a's private
+  key, which never left the device. This is exactly what the test
+  `test_responder_rejects_impersonator_with_wrong_long_term_key` verifies.
+
+FORWARD SECRECY:
+  Notice the keys in INITIATE are "fresh ephemeral keys." New ones are
+  generated for every single encounter and deleted immediately after. This
+  means if someone steals these keys tomorrow, they can't decrypt today's
+  session — the key no longer exists. This is called "forward secrecy."
+
+
+================================================================
+  2. TRUST FOLDER — The Full Device Lifecycle Framework
+================================================================
+
+The challenge: the original project had a simple TrustStore (a JSON file
+mapping device_id → public keys). Once you paired a device, it was trusted
+forever. There was no way to revoke access except deleting the JSON manually.
+I built a full lifecycle management layer on top of it.
+
+The trust/ folder is structured as layers, each built on the one below:
+
+    trust/models.py          ← data structures (no logic)
+    trust/exceptions.py      ← custom error types
+    trust/trust_store.py     ← abstract + in-memory/JSON storage
+    trust/device_registry.py ← CRUD operations on device records
+    trust/trust_policy.py    ← pluggable trust evaluation rules
+    trust/trust_manager.py   ← the public facade combining all layers
+    trust/integration.py     ← adapters to plug into the proximity protocol
+
+
+--- LAYER 1: MODELS (trust/models.py) ---
+
+I defined all the data shapes first, before any logic:
+
+  TrustStatus (enum): TRUSTED, REVOKED, EXPIRED
+    These are the only three states a device can be in. Python str+Enum so
+    they serialize to plain strings in JSON ("TRUSTED", not some number).
+
+  ImportMode (enum): REPLACE, SKIP_EXISTING, OVERWRITE_EXISTING
+    Controls what happens if you import a trust database that has overlapping
+    device records. SKIP_EXISTING is the safe default for migration.
+
+  Clock (Protocol):
+    A structural protocol (Python's duck-typing interface for time). Any
+    object with a `now() -> float` method satisfies it.
+    - SystemClock: returns `time.time()` (real wall clock)
+    - FixedClock: returns a fixed float you give it at construction time
+    WHY? Because tests that check expiry logic cannot sleep 30 days waiting
+    for a device to expire. With FixedClock, you set the clock to any time
+    you want. The framework never calls `time.time()` directly; it always
+    goes through the injected clock.
+
+  KeyMaterial (frozen dataclass):
+    Stores one version of a device's public keys:
+      x25519_pub, mlkem_pub, version number, created_at, retired_at
+    Frozen means it's immutable — you can't accidentally mutate a key record.
+    Used inside DeviceRecord for key_history (old rotated keys are kept here).
+
+  DeviceRecord (dataclass):
+    The complete picture of one paired device:
+      device_id, uuid, alias, current_key (a KeyMaterial), fingerprint,
+      paired_at, last_connected_at, revoked (bool), revoked_at, reason,
+      expires_at, key_history (list of old KeyMaterials), metadata (dict)
+    This replaces the old store's flat {"x25519_pub": ..., "mlkem_pub": ...}.
+
+
+--- LAYER 2: TRUST STORE (trust/trust_store.py) ---
+
+The ABC defines what a store must do:
+  save(record), get(device_id), delete(device_id), list_all(), clear()
+
+Two implementations:
+
+  InMemoryTrustStore: backed by a dict. Zero disk I/O. Used in tests.
+
+  JsonTrustStore: reads/writes a JSON file. Schema versioned — if a future
+    version changes the format, the version number lets code detect and
+    migrate. Uses atomic writes (write to temp file, then rename) so a crash
+    mid-write never leaves a corrupt trust database.
+
+
+--- LAYER 3: DEVICE REGISTRY (trust/device_registry.py) ---
+
+Wraps the store with higher-level queries:
+  - register(): creates a DeviceRecord and saves it; raises DuplicateDeviceError
+    if the device_id is already present
+  - update(): modifies specific fields of an existing record
+  - find_by_alias(): searches by human-readable name
+  - find_by_fingerprint(): searches by the safety number from pairing
+  - search_by_status(): returns all TRUSTED, all REVOKED, etc.
+
+
+--- LAYER 4: TRUST POLICY (trust/trust_policy.py) ---
+
+This is the "what does trusted mean?" layer. I used the Strategy Pattern:
+a TrustPolicy ABC with `evaluate(record, now) -> TrustStatus` and
+`validate(record, now)` (raises an error if not trusted).
+
+Concrete policies:
+
+  DefaultTrustPolicy:
+    Checks in priority order:
+      1. Is the device revoked? → REVOKED
+      2. Has the expiry time passed? → EXPIRED
+      3. Has the device been inactive too long? → EXPIRED (optional threshold)
+      4. Otherwise → TRUSTED
+    The `max_inactivity_seconds` parameter is optional. If set, a device
+    that hasn't connected in that many seconds automatically becomes EXPIRED.
+
+  AlwaysTrustPolicy:
+    Always returns TRUSTED. Used in tests and migration scenarios where you
+    want to read data without enforcing lifecycle rules.
+
+  CompositeTrustPolicy:
+    Chains multiple policies together. The first non-TRUSTED result wins.
+    Example: combine DefaultTrustPolicy + MaximumKeyAgePolicy so a device
+    is rejected if EITHER it's revoked OR its keys are too old.
+    Requires at least one policy (raises ValueError if constructed empty).
+
+  MaximumKeyAgePolicy:
+    Expires trust when the current key's `created_at` is older than a
+    threshold. Useful for enforcing key rotation hygiene — if a device
+    hasn't rotated its keys in 90 days, it stops being trusted automatically.
+
+WHY SEPARATE POLICY FROM DATA?
+  The data (DeviceRecord) describes a device. The policy describes what
+  the current deployment considers "trusted." Different deployments may
+  have different rules. A test might use AlwaysTrustPolicy; production uses
+  DefaultTrustPolicy with a 30-day inactivity window. Neither one requires
+  changing the data model.
+
+
+--- LAYER 5: TRUST MANAGER (trust/trust_manager.py) ---
+
+The public API that everything else uses. It's a facade over:
+  DeviceRegistry + TrustPolicy + Clock
+
+Key methods:
+
+  register_device(device_id, x25519_pub, mlkem_pub, fingerprint, ...):
+    Creates a DeviceRecord, stamps it with the current clock time,
+    stores it. Optional valid_for_seconds sets an expiry.
+
+  is_trusted(device_id) → bool:
+    Quick boolean: does the current policy consider this device trusted right
+    now? The proximity protocol calls this before every handshake.
+
+  validate_session(device_id):
+    Calls the policy's validate() — raises DeviceRevokedError or
+    DeviceExpiredError if the device is not trusted. This is the gate that
+    sits before every session. No session begins without passing this.
+
+  revoke_trust(device_id, reason):
+    Sets revoked=True, stamps revoked_at with current time and the reason.
+    The device is now rejected on the next connection attempt.
+
+  restore_trust(device_id):
+    Clears revoked=True and revoked_at. The device is trusted again.
+    Also clears EXPIRED state (the policy re-evaluates fresh).
+
+  rotate_key(device_id, new_x25519_pub, new_mlkem_pub):
+    Archives the current KeyMaterial into key_history with a retired_at
+    timestamp, then creates a new KeyMaterial at version N+1.
+    Why keep history? Forensics — if you need to know what key a device
+    was using during a past session, you can look it up.
+
+  export_database() / import_database():
+    Serializes the entire trust store to a JSON dict (schema versioned).
+    Import supports the three ImportMode options for conflict resolution.
+    Use case: backup, sync between machines, or forensic archiving.
+
+  record_connection(device_id):
+    Stamps last_connected_at. Called AFTER a handshake succeeds (not before),
+    so the timestamp reflects actual successful sessions, not attempts.
+
+
+--- LAYER 6: INTEGRATION (trust/integration.py) ---
+
+This is the adapter that plugs the trust framework into the proximity
+protocol — without modifying any protocol code at all.
+
+ProtocolPeerStore wraps a TrustManager and presents the same interface as
+the old flat TrustStore (just `get_peer(peer_id) → dict | None`).
+
+The key insight: `initiate_encounter` and `respond_to_encounter` in
+proximity_protocol.py already handle `None` from get_peer as "unpaired
+peer, reject." By returning None for any non-TRUSTED device, revocation
+becomes invisible to the protocol — a revoked device and a never-seen
+stranger get exactly the same rejection on the wire.
+
+Other helpers in this file:
+  register_paired_peer(): bridge between the pairing handshake's peer dict
+    and the trust framework's field names (so pairing code doesn't need to
+    know trust framework internals).
+  compute_pairing_fingerprint(): delegates to the pairing module's existing
+    fingerprint function, without reimplementing it (two different fingerprint
+    implementations would be a vulnerability, not just a bug).
+  migrate_legacy_store(): one-way migration from the old flat JSON store to
+    the new TrustManager for existing deployments that already have pairings.
+
+IMPORTANT DESIGN RULE: integration.py imports from the crypto layer lazily
+(inside functions, not at module top). This means the entire trust/ package
+can be imported and tested with nothing but the standard library — no liboqs,
+no BLE stack, no webcam needed. Trust logic tests run in milliseconds.
+
+
+================================================================
+  3. WEBSITE FOLDER — FastAPI Backend + Live Visualizer
+================================================================
+
+File: website/server.py
+
+The website makes the project visible. Instead of running CLI commands and
+seeing text output, you open a browser and watch the cryptographic steps
+appear in real time — the actual hex values, not a simulation.
+
+HOW THE BACKEND WORKS:
+
+  FastAPI as the framework:
+    FastAPI is a modern Python web framework built on asyncio (the same
+    async system used in the rest of the project). It handles HTTP routes
+    (/pair/start, /reconnect, /message, /stranger, /reset) and WebSocket
+    connections.
+
+  WebSocket for real-time updates:
+    When you click "Pair Fresh," the browser opens a WebSocket connection
+    to /ws. A WebSocket is like a phone call between browser and server —
+    it stays open so the server can push data to the browser at any time.
+    Without WebSocket, the browser would have to keep asking "are you done
+    yet?" (polling). With WebSocket, each step fires as an event the moment
+    it happens.
+
+  Real crypto, not fake:
+    The server imports the actual crypto functions — generate_identity,
+    respond_to_qr, complete_pairing, initiate_encounter, respond_to_encounter.
+    Every value shown in the browser (the X25519 public key, the ML-KEM
+    ciphertext, the ASCON session key) is computed live, right there.
+
+  Session counter (_session):
+    Each "scenario" (pairing, reconnect, stranger) runs as a series of
+    steps. Each step is numbered. The _session counter tracks which step
+    we're on and sends a message like:
+        {"step": 3, "title": "Hybrid Key Exchange", "detail": "...", "hex": "..."}
+    to the WebSocket. The browser renders each one as a new row in the
+    step list.
+
+  Bug fix for repeating steps:
+    The original code used asyncio.create_task() without cancelling the
+    previous task. If a user clicked "Pair Fresh" twice quickly, two
+    concurrent flows ran simultaneously, both writing to the same _session
+    counter and WebSocket. Steps interleaved and appeared twice.
+    Fix: added a global _active_task tracker. Every endpoint calls
+    _cancel_active_task() before creating a new task. Only one flow runs
+    at a time. (This was debugged and fixed during this session.)
+
+  Three scenarios:
+    /pair/start    → runs the QR pairing flow, step by step
+    /reconnect     → runs the proximity reconnect flow, step by step
+    /stranger      → runs a stranger attack, showing the rejection
+    /message       → encrypts and decrypts a message, showing the ciphertext
+    /reset         → clears all state, cancels any running flow
+
+  Static serving:
+    FastAPI also serves the HTML/CSS/JS files in website/static/ directly
+    (at port 8000). There is also a React version in ui/client/ (at port
+    3000) that uses the same backend — it proxies all API calls through
+    Vite's dev server.
+
+
+================================================================
+  4. TESTS FOLDER — Attack Scenario Testing
+================================================================
+
+File: tests/test_proximity_protocol.py   ← the main security tests
+File: tests/test_trust_framework.py      ← the trust lifecycle tests
+File: tests/test_transport_wifi.py       ← WiFi transport unit tests
+File: tests/test_transport_ble.py        ← BLE transport unit tests (mocked)
+
+APPROACH: All security tests use a LoopbackTransport — an in-process fake
+transport backed by Python queues. This means:
+  - No network hardware required
+  - Tests run in under a second
+  - The same protocol code runs as in production (no mocking of the security
+    logic itself, only the physical layer)
+
+TESTS WRITTEN:
+
+  test_authenticated_handshake_and_token_exchange:
+    The "happy path." Alice and Bob are properly paired. Bob's responder runs
+    in a background thread (as it would in a real encounter). Alice initiates.
+    Both sides verify: Alice got Bob's token, Bob got Alice's token.
+    This verifies the full end-to-end flow works.
+
+  test_initiator_refuses_unpaired_peer:
+    Alice tries to initiate with a device not in her trust store.
+    Expected result: UnpairedPeerError raised immediately, before any message
+    is sent. This verifies the initiator side checks trust before transmitting.
+
+  test_responder_refuses_unknown_claimed_device_id (STRANGER TEST):
+    A "stranger" device (never paired with Bob) sends a crafted INITIATE
+    message claiming its own identity. Bob looks it up → NOT IN TRUST STORE.
+    Expected result: UnpairedPeerError. The stranger gets no response.
+    This is the "silent rejection" — telling a stranger nothing is the right
+    behaviour.
+
+  test_responder_rejects_impersonator_with_wrong_long_term_key (MITM TEST):
+    This is the hardest attack: Mallory claims to be "device-a" (a real
+    peer of Bob's!) but uses a MAC key of all-zero bytes (she doesn't have
+    device-a's private key, so she can't compute the real one).
+    Expected result: AuthenticationFailedError. Bob computes what the HMAC
+    SHOULD be using his stored long-term secret, compares with what Mallory
+    sent, finds a mismatch, and rejects.
+    This directly tests the core security guarantee of the proximity protocol.
+
+  trust framework tests (test_trust_framework.py — 88 tests):
+    Tests cover every operation of TrustManager:
+    - Register, revoke, restore, expire
+    - DefaultTrustPolicy correctly evaluates each state
+    - AlwaysTrustPolicy always returns TRUSTED (tests pass this in)
+    - CompositeTrustPolicy raises if given no sub-policies
+    - MaximumKeyAgePolicy expires when key is too old
+    - Key rotation archives old key, increments version
+    - Export/import with all three ImportMode settings
+    - ProtocolPeerStore returns None for revoked devices (so the proximity
+      protocol rejects them identically to strangers)
+    - FixedClock lets expiry tests run instantly without sleeping
+    - InMemoryTrustStore and JsonTrustStore both pass the same test suite
+    - DuplicateDeviceError, DeviceNotFoundError, DeviceRevokedError,
+      DeviceExpiredError, TrustStoreCorruptError all raised correctly
+
+ALL 131 TESTS PASS. Run them with:
+    pytest tests/ -q --ignore=tests/test_transport_ble.py   (Windows, no BLE)
+    pytest tests/ -q                                         (Linux/Mac)
+
+
+================================================================
+  SUMMARY: FILES I WROTE OR PRIMARILY AUTHORED
+================================================================
+
+proximity/
+  transport_base.py      — Abstract Transport interface (ABC pattern)
+  transport_wifi.py      — WiFi: mDNS discovery + TCP framing + threading
+  transport_ble.py       — BLE: asyncio GATT server, chunking, bridging
+  proximity_protocol.py  — MAC auth handshake, wire format, ephemeral keys
+
+trust/
+  models.py              — TrustStatus, Clock, KeyMaterial, DeviceRecord
+  exceptions.py          — All custom error types for the trust framework
+  trust_store.py         — InMemoryTrustStore + JsonTrustStore (ABC)
+  device_registry.py     — CRUD layer over the store
+  trust_policy.py        — DefaultTrustPolicy, AlwaysTrustPolicy, CompositeTrustPolicy,
+                           MaximumKeyAgePolicy (Strategy Pattern)
+  trust_manager.py       — Public facade: register, revoke, restore, rotate, validate
+  integration.py         — ProtocolPeerStore adapter (no changes to protocol code needed)
+  __init__.py            — Clean re-exports so callers just do `from trust import TrustManager`
+
+website/
+  server.py              — FastAPI backend: WebSocket streaming, real crypto per step,
+                           three scenario flows, bug fix for concurrent task collision
+
+tests/
+  test_proximity_protocol.py  — Stranger attack, MITM impersonation, happy path
+  test_transport_wifi.py      — WiFi transport unit tests
+  test_transport_ble.py       — BLE transport unit tests (mocked BLE adapters)
+  test_trust_framework.py     — 88 trust lifecycle tests (all states, policies, persistence)
+
+Also contributed:
+  README_V2              — Added Windows-specific setup notes and dependency conflict fixes
+  identity.json crypto   — Passphrase lock on private keys: Scrypt KDF + ASCON-128a encryption
+  demo/trust_cli.py      — Command-line interface for trust lifecycle operations
+
+================================================================
+  END OF DOCUMENT
+================================================================

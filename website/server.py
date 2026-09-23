@@ -40,6 +40,18 @@ app = FastAPI()
 
 STEP_DELAY = 1.0
 
+_step_mode: str = "auto"      # "auto" | "manual"
+_step_gate: asyncio.Event | None = None
+_active_task: asyncio.Task | None = None  # only one flow runs at a time
+
+
+def _cancel_active_task():
+    """Cancel any in-flight pairing/reconnect/stranger/message task."""
+    global _active_task
+    if _active_task and not _active_task.done():
+        _active_task.cancel()
+    _active_task = None
+
 
 # ─── Connection manager ───────────────────────────────────────────────────────
 
@@ -81,6 +93,9 @@ state: dict[str, Any] = {
     "trust_b": None,
 }
 
+# Pairing state saved per device-combo key ("Label A:Label B")
+device_registry: dict[str, dict] = {}
+
 # Per-flow step tracking (reset at start of each flow)
 _session: dict[str, Any] = {
     "counters": {"device-a": 0, "device-b": 0},
@@ -109,8 +124,9 @@ async def ws_endpoint(websocket: WebSocket, device: str):
 
 @app.get("/qr")
 async def get_qr():
-    identity = generate_identity("device-a")
-    state["identity_a"] = identity
+    if state["identity_a"] is None:
+        state["identity_a"] = generate_identity("device-a")
+    identity = state["identity_a"]
     raw_payload = build_payload(identity.device_id, identity.x25519_pub, identity.mlkem_pub)
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L)
     qr.add_data(base64.b64encode(raw_payload), optimize=0)
@@ -129,33 +145,82 @@ async def get_qr():
 
 @app.post("/pair/start")
 async def pair_start():
+    global _active_task
     if state["identity_a"] is None:
         return {"error": "call /qr first"}
-    asyncio.create_task(_run_pairing())
+    _cancel_active_task()
+    _active_task = asyncio.create_task(_run_pairing())
     return {"status": "started"}
 
 
 @app.post("/message")
 async def send_message(body: dict = Body(...)):
+    global _active_task
     if state["trust_a"] is None:
         return {"error": "pair devices first"}
-    asyncio.create_task(_run_message(body.get("text", "hello")))
+    _cancel_active_task()
+    _active_task = asyncio.create_task(_run_message(body.get("text", "hello")))
     return {"status": "started"}
+
+
+@app.post("/reset")
+async def reset_state():
+    _cancel_active_task()
+    state["identity_a"] = None
+    state["identity_b"] = None
+    state["trust_a"]    = None
+    state["trust_b"]    = None
+    _reset_session()
+    return {"status": "reset"}
+
+
+@app.post("/switch-device")
+async def switch_device(body: dict = Body(...)):
+    from_key = body.get("from_key", "")
+    to_key   = body.get("to_key", "")
+
+    # Save current state under the old combo key
+    if from_key:
+        device_registry[from_key] = {
+            "identity_a": state["identity_a"],
+            "identity_b": state["identity_b"],
+            "trust_a":    state["trust_a"],
+            "trust_b":    state["trust_b"],
+        }
+
+    # Restore saved state for the new combo, or start fresh
+    if to_key in device_registry:
+        saved = device_registry[to_key]
+        state.update(saved)
+        paired = saved.get("trust_a") is not None
+    else:
+        state["identity_a"] = None
+        state["identity_b"] = None
+        state["trust_a"]    = None
+        state["trust_b"]    = None
+        _reset_session()
+        paired = False
+
+    return {"paired": paired}
 
 
 @app.post("/reconnect")
 async def reconnect():
+    global _active_task
     if state["trust_a"] is None:
         return {"error": "pair devices first"}
-    asyncio.create_task(_run_reconnect())
+    _cancel_active_task()
+    _active_task = asyncio.create_task(_run_reconnect())
     return {"status": "started"}
 
 
 @app.post("/stranger")
 async def stranger_attack():
+    global _active_task
     if state["identity_b"] is None:
         return {"error": "pair devices first to set up Device B as target"}
-    asyncio.create_task(_run_stranger())
+    _cancel_active_task()
+    _active_task = asyncio.create_task(_run_stranger())
     return {"status": "started"}
 
 

@@ -21,6 +21,9 @@
         <button id="btn-pair" class="btn btn-primary" disabled>Pair Fresh</button>
         <button id="btn-reconnect" class="btn btn-secondary" disabled title="Run proximity reconnect after pairing">🔄 Reconnect</button>
         <button id="btn-stranger" class="btn btn-danger" disabled title="Demo a stranger being rejected">👾 Stranger Attack</button>
+        <span class="row-sep">|</span>
+        <button id="btn-step-toggle" class="btn btn-secondary" title="Toggle step-by-step mode">⏭ Auto</button>
+        <button id="btn-next-step" class="btn btn-advance" style="display:none" disabled>▶ Next Step<span id="step-counter"></span></button>
       </div>
       <div class="msg-row">
         <input id="msg-input" class="msg-input" type="text"
@@ -38,7 +41,7 @@
         <div class="panel-header-left">
           <div class="device-badge badge-a" id="badge-a">Device A</div>
           <select class="device-select"
-                  onchange="updateDeviceLabel('a', this.options[this.selectedIndex].text)">
+                  onchange="changeDevice('a', this.options[this.selectedIndex].text)">
             <option>💻 Laptop</option>
             <option>📱 Phone</option>
             <option>📊 Tablet</option>
@@ -71,7 +74,7 @@
         <div class="panel-header-left">
           <div class="device-badge badge-b" id="badge-b">Device B</div>
           <select class="device-select"
-                  onchange="updateDeviceLabel('b', this.options[this.selectedIndex].text)">
+                  onchange="changeDevice('b', this.options[this.selectedIndex].text)">
             <option>💻 Laptop</option>
             <option selected>📱 Phone</option>
             <option>📊 Tablet</option>

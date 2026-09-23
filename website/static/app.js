@@ -30,24 +30,33 @@ const DEFAULT_META = { icon: "ℹ️", type: "text", valueColor: {} };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
-const feedA        = document.getElementById("feed-a");
-const feedB        = document.getElementById("feed-b");
-const statusA      = document.getElementById("status-a");
-const statusB      = document.getElementById("status-b");
-const qrArea       = document.getElementById("qr-area");
-const btnPair      = document.getElementById("btn-pair");
-const btnReconnect = document.getElementById("btn-reconnect");
-const btnStranger  = document.getElementById("btn-stranger");
-const btnSend      = document.getElementById("btn-send");
-const msgInput     = document.getElementById("msg-input");
-const banner       = document.getElementById("paired-banner");
-const bannerIcon   = document.getElementById("banner-icon");
-const bannerTitle  = document.getElementById("banner-title");
-const bannerSub    = document.getElementById("banner-sub");
+const feedA         = document.getElementById("feed-a");
+const feedB         = document.getElementById("feed-b");
+const statusA       = document.getElementById("status-a");
+const statusB       = document.getElementById("status-b");
+const qrArea        = document.getElementById("qr-area");
+const btnPair       = document.getElementById("btn-pair");
+const btnReconnect  = document.getElementById("btn-reconnect");
+const btnStranger   = document.getElementById("btn-stranger");
+const btnSend       = document.getElementById("btn-send");
+const msgInput      = document.getElementById("msg-input");
+const banner        = document.getElementById("paired-banner");
+const bannerIcon    = document.getElementById("banner-icon");
+const bannerTitle   = document.getElementById("banner-title");
+const bannerSub     = document.getElementById("banner-sub");
+const btnStepToggle = document.getElementById("btn-step-toggle");
+const btnNextStep   = document.getElementById("btn-next-step");
+const stepCounter   = document.getElementById("step-counter");
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let pairedDone = false;
+let pairedDone   = false;
+let stepByStep   = false;
+const pendingQueue = [];  // [{feed, device, event}]
+
+// Matches the default selected options in index.html
+let currentLabelA = "💻 Laptop";
+let currentLabelB = "📱 Phone";
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
@@ -132,6 +141,95 @@ function showBanner(icon, title, sub, color) {
   banner.className = "paired-banner show" + (color === "red" ? " banner-red" : "");
 }
 
+// ── Step-by-step engine ───────────────────────────────────────────────────────
+
+function handleEvent(feed, device, event) {
+  if (event.step === "pairing_done") {
+    appendCard(feed, event);
+    if (device === "device-a") {
+      showBanner("✅", "Devices Paired", event.data.fingerprint, "green");
+      pairedDone            = true;
+      btnSend.disabled      = false;
+      msgInput.disabled     = false;
+      btnReconnect.disabled = false;
+      btnStranger.disabled  = false;
+    }
+    return;
+  }
+
+  if (event.step === "reconnect_done") {
+    appendCard(feed, event);
+    if (device === "device-a") {
+      const ok = event.data.keys_match;
+      showBanner("🔄", "Reconnection Successful",
+        ok ? "Fresh session key — forward secrecy ✓" : "Key mismatch!",
+        ok ? "green" : "red");
+    }
+    return;
+  }
+
+  if (event.step === "stranger_rejected") {
+    appendCard(feed, event);
+    if (device === "device-a") {
+      showBanner("⛔", "Stranger Rejected",
+        "Unknown device blocked — only paired devices may connect", "red");
+    }
+    return;
+  }
+
+  appendCard(feed, event);
+}
+
+function processOrQueue(feed, device, event) {
+  if (stepByStep) {
+    pendingQueue.push({ feed, device, event });
+    updateStepUI();
+  } else {
+    handleEvent(feed, device, event);
+  }
+}
+
+function updateStepUI() {
+  const n = pendingQueue.length;
+  if (stepByStep) {
+    btnNextStep.style.display = "";
+    btnNextStep.disabled = n === 0;
+    stepCounter.textContent = n > 0 ? ` (${n})` : "";
+  } else {
+    btnNextStep.style.display = "none";
+    stepCounter.textContent = "";
+  }
+}
+
+function advanceStep() {
+  if (pendingQueue.length === 0) return;
+  const { feed, device, event } = pendingQueue.shift();
+  handleEvent(feed, device, event);
+  updateStepUI();
+}
+
+function clearQueue() {
+  pendingQueue.length = 0;
+  updateStepUI();
+}
+
+// ── Step mode toggle ──────────────────────────────────────────────────────────
+
+btnStepToggle.addEventListener("click", () => {
+  stepByStep = !stepByStep;
+  if (stepByStep) {
+    btnStepToggle.textContent = "⏸ Step-by-Step";
+    btnStepToggle.classList.add("btn-step-active");
+  } else {
+    btnStepToggle.textContent = "⏭ Auto";
+    btnStepToggle.classList.remove("btn-step-active");
+    while (pendingQueue.length > 0) advanceStep();
+  }
+  updateStepUI();
+});
+
+btnNextStep.addEventListener("click", advanceStep);
+
 // ── QR loading ────────────────────────────────────────────────────────────────
 
 async function loadQr() {
@@ -170,42 +268,7 @@ function connectDevice(device) {
 
   ws.onmessage = (e) => {
     const event = JSON.parse(e.data);
-
-    // Broadcast events — each handler adds only to its own feed
-    if (event.step === "pairing_done") {
-      appendCard(feed, event);
-      if (device === "device-a") {
-        showBanner("✅", "Devices Paired", event.data.fingerprint, "green");
-        pairedDone            = true;
-        btnSend.disabled      = false;
-        msgInput.disabled     = false;
-        btnReconnect.disabled = false;
-        btnStranger.disabled  = false;
-      }
-      return;
-    }
-
-    if (event.step === "reconnect_done") {
-      appendCard(feed, event);
-      if (device === "device-a") {
-        const ok = event.data.keys_match;
-        showBanner("🔄", "Reconnection Successful",
-          ok ? "Fresh session key — forward secrecy ✓" : "Key mismatch!",
-          ok ? "green" : "red");
-      }
-      return;
-    }
-
-    if (event.step === "stranger_rejected") {
-      appendCard(feed, event);
-      if (device === "device-a") {
-        showBanner("⛔", "Stranger Rejected",
-          "Unknown device blocked — only paired devices may connect", "red");
-      }
-      return;
-    }
-
-    appendCard(feed, event);
+    processOrQueue(feed, device, event);
   };
 
   ws.onerror = () => { stat.textContent = "error"; };
@@ -225,6 +288,7 @@ btnPair.addEventListener("click", async () => {
   pairedDone            = false;
   btnSend.disabled      = true;
   msgInput.disabled     = true;
+  clearQueue();
   await fetch("/pair/start", { method: "POST" });
 });
 
@@ -232,6 +296,7 @@ btnReconnect.addEventListener("click", async () => {
   feedA.innerHTML  = "";
   feedB.innerHTML  = "";
   banner.className = "paired-banner";
+  clearQueue();
   await fetch("/reconnect", { method: "POST" });
 });
 
@@ -239,6 +304,7 @@ btnStranger.addEventListener("click", async () => {
   feedA.innerHTML  = "";
   feedB.innerHTML  = "";
   banner.className = "paired-banner";
+  clearQueue();
   await fetch("/stranger", { method: "POST" });
 });
 
@@ -248,6 +314,7 @@ btnSend.addEventListener("click", async () => {
   btnSend.disabled = true;
   feedA.innerHTML  = "";
   feedB.innerHTML  = "";
+  clearQueue();
   await fetch("/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -258,11 +325,37 @@ btnSend.addEventListener("click", async () => {
 
 msgInput.addEventListener("keydown", e => { if (e.key === "Enter") btnSend.click(); });
 
-// ── Device label update ───────────────────────────────────────────────────────
+// ── Device change — saves current pair state, restores if seen before ─────────
 
-function updateDeviceLabel(panel, value) {
+async function changeDevice(panel, label) {
   const badge = document.getElementById(`badge-${panel}`);
-  if (badge) badge.textContent = value;
+  if (badge) badge.textContent = label;
+
+  feedA.innerHTML  = "";
+  feedB.innerHTML  = "";
+  banner.className = "paired-banner";
+  clearQueue();
+
+  const fromKey = `${currentLabelA}:${currentLabelB}`;
+  if (panel === "a") currentLabelA = label;
+  else               currentLabelB = label;
+  const toKey = `${currentLabelA}:${currentLabelB}`;
+
+  const res  = await fetch("/switch-device", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from_key: fromKey, to_key: toKey }),
+  });
+  const data = await res.json();
+
+  pairedDone            = data.paired;
+  btnSend.disabled      = !data.paired;
+  msgInput.disabled     = !data.paired;
+  btnReconnect.disabled = !data.paired;
+  btnStranger.disabled  = !data.paired;
+  btnPair.disabled      = false;  // always allow re-pairing
+
+  await loadQr();
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

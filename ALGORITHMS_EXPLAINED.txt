@@ -1,0 +1,844 @@
+==============================================================
+  THE MATHS BEHIND EVERY ALGORITHM WE USED
+  From absolute basics — explained for a professor
+==============================================================
+
+Before diving into each algorithm, we need three basic ideas that
+every single algorithm in this project builds on.
+
+
+==============================================================
+  FOUNDATION 1: MODULAR ARITHMETIC  ("clock maths")
+==============================================================
+
+Normal arithmetic: 5 + 9 = 14
+Modular arithmetic: 5 + 9 = 2  (mod 12)
+
+Think of a clock. After 12, you wrap around. 13 o'clock = 1 o'clock.
+The "mod" operation just means: divide by the number, keep the remainder.
+
+  17 mod 5 = 2   (because 17 = 3×5 + 2)
+  25 mod 7 = 4   (because 25 = 3×7 + 4)
+  12 mod 12 = 0  (clock: 12 hours later is back to 0)
+
+WHY IT MATTERS FOR CRYPTO:
+Modular arithmetic creates "one-way" operations — easy to compute forward,
+practically impossible to reverse.
+
+Example:
+  3^x mod 17 = 12
+  What is x?   → Very hard to find.
+
+  This is called the "Discrete Logarithm Problem."
+  It is the foundation of classical cryptography.
+
+
+==============================================================
+  FOUNDATION 2: THE CONCEPT OF A "TRAPDOOR FUNCTION"
+==============================================================
+
+A trapdoor function is:
+  - Easy to compute in one direction
+  - Practically impossible to reverse WITHOUT a secret piece of information
+    (the "trapdoor")
+
+Example:
+  Multiply two large prime numbers:
+    97 × 83 = 8051       ← Easy (milliseconds)
+    8051 = ? × ?         ← Which primes? Hard (could take years for huge numbers)
+
+  The trapdoor: knowing one of the prime factors.
+
+Every algorithm in this project is built on a different trapdoor function.
+
+
+==============================================================
+  FOUNDATION 3: WHAT "SECURE" MEANS IN CRYPTO
+==============================================================
+
+We say an algorithm is "computationally secure" if:
+  Breaking it would require more computing power or time than exists
+  in the universe before the heat death of the universe.
+
+This does NOT mean "impossible." It means "infeasible."
+  For a 128-bit key: trying every possible key at 1 trillion tries/second
+  would take 10^19 years. (Universe is ~13.8 × 10^9 years old.)
+
+This is why key size matters: bigger keys = more time to brute-force.
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 1: X25519
+  (Elliptic Curve Diffie-Hellman)
+  Used for: classical shared secret in pairing + proximity
+
+==============================================================
+==============================================================
+
+
+PART A: WHAT IS A DIFFIE-HELLMAN KEY EXCHANGE?
+------------------------------------------------
+Invented by Whitfield Diffie and Martin Hellman in 1976.
+The problem they solved: how do two people agree on a shared secret
+over a channel that everyone can listen to?
+
+THE PAINT ANALOGY (the textbook way to explain it):
+  1. Alice and Bob agree publicly on a starting colour: YELLOW
+  2. Alice secretly picks RED.   Bob secretly picks BLUE.
+  3. Alice mixes yellow + red → ORANGE.  She sends orange to Bob.
+     Bob mixes yellow + blue → GREEN.    He sends green to Alice.
+  4. Alice takes green + her secret red → BROWN.
+     Bob takes orange + his secret blue → BROWN.
+  5. Both arrive at BROWN, but an eavesdropper only ever saw:
+     yellow, orange, green. They cannot figure out the final colour.
+
+The maths equivalent:
+  Let p be a large prime number (public).
+  Let g be a generator (public, small number like 2 or 5).
+
+  Alice picks private a.  Bob picks private b.
+  Alice sends:  A = g^a mod p   (her "public key")
+  Bob sends:    B = g^b mod p   (his "public key")
+
+  Alice computes: B^a mod p = (g^b)^a mod p = g^(ab) mod p
+  Bob computes:   A^b mod p = (g^a)^b mod p = g^(ab) mod p
+
+  Both get g^(ab) mod p — the shared secret.
+  Eve (eavesdropper) sees g, p, g^a, g^b.
+  To get g^(ab) she must solve the Discrete Logarithm Problem:
+  "Given g^a mod p, find a." This is computationally infeasible for large p.
+
+PROBLEM WITH THIS VERSION:
+  Large prime numbers require very large key sizes (2048+ bits) to be secure.
+  For devices with limited memory or battery, this is expensive.
+  Solution: use a different mathematical structure — elliptic curves.
+
+
+PART B: WHAT IS AN ELLIPTIC CURVE?
+-------------------------------------
+An elliptic curve is defined by the equation:
+  y² = x³ + ax + b
+
+This is NOT an ellipse. The name is historical (came from calculating
+arc lengths of ellipses).
+
+When plotted, these curves have a special shape — symmetric about the x-axis,
+with a smooth continuous body.
+
+The KEY property is: you can define ADDITION on points of the curve.
+
+GEOMETRIC POINT ADDITION:
+  Given two points P and Q on the curve:
+  Draw a line through P and Q.
+  It intersects the curve at a third point.
+  Reflect that point over the x-axis.
+  That reflected point is P + Q.
+
+  Special case (doubling): if P = Q, draw the tangent line at P instead.
+
+ALGEBRAIC FORMULA:
+  If P = (x₁, y₁) and Q = (x₂, y₂) and P ≠ Q:
+    slope m = (y₂ - y₁) / (x₂ - x₁)
+    x₃ = m² - x₁ - x₂
+    y₃ = m(x₁ - x₃) - y₁
+    P + Q = (x₃, y₃)
+
+All of this is done modulo a large prime p (wrapping around, clock-style).
+
+SCALAR MULTIPLICATION:
+  k × P means "add P to itself k times"
+  k × P = P + P + P + ... + P  (k times)
+
+  This can be computed efficiently using "double-and-add":
+  Like computing 2^10 = ((((2²)²)²)... — squaring repeatedly.
+  For k × P: repeatedly double P and conditionally add.
+  This makes computing k × P fast (logarithmic time in k).
+
+THE TRAPDOOR:
+  Given P and k × P, find k.
+  This is the "Elliptic Curve Discrete Logarithm Problem" (ECDLP).
+  No efficient classical algorithm exists for this on the right curve.
+  Result: elliptic curves give the same security as RSA with MUCH smaller
+  keys. 256-bit ECC ≈ 3072-bit RSA in security level.
+
+
+PART C: CURVE25519 SPECIFICALLY
+---------------------------------
+Designed by Daniel Bernstein (2006).
+Equation: y² = x³ + 486662x² + x  (over the prime p = 2²⁵⁵ - 19)
+
+Why 2²⁵⁵ - 19?
+  - It's a prime number just below a power of 2
+  - Numbers can be represented in 255 bits = efficient on 64-bit computers
+  - Special form makes modular reduction (the mod operation) very fast
+
+The name "25519" comes from "255" (bit length) and "19" (the constant
+subtracted from the prime).
+
+Key sizes:
+  Private key: 32 bytes (256 bits) — a random 256-bit number
+  Public key:  32 bytes (256 bits) — the x-coordinate of k × G
+               (G is the "generator point", a fixed public starting point)
+
+X25519 SPECIFICALLY (the key exchange protocol):
+  Alice's private key: a (random 32 bytes)
+  Alice's public key:  A = a × G
+
+  Bob's private key:   b (random 32 bytes)
+  Bob's public key:    B = b × G
+
+  Shared secret:       a × B = a × (b × G) = ab × G
+                       b × A = b × (a × G) = ab × G
+  Both sides get the same point! Only the x-coordinate is used as secret.
+
+WHY X25519 SPECIFICALLY (not other curves)?
+  - Resistant to timing attacks by design (constant-time computation)
+  - No patent issues
+  - Simpler implementation, less room for bugs
+  - Used by TLS 1.3, Signal, WhatsApp, SSH
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 2: ML-KEM-768
+  (Module Lattice Key Encapsulation Mechanism)
+  Used for: post-quantum shared secret — quantum-proof layer
+  Standard: NIST FIPS 203, August 2024
+
+==============================================================
+==============================================================
+
+
+PART A: WHY DO WE NEED THIS? (THE QUANTUM THREAT)
+----------------------------------------------------
+Classical computers solve discrete log by trying factors systematically.
+A quantum computer, using Shor's Algorithm (1994), can solve discrete log
+and factoring EXPONENTIALLY faster.
+
+IMPACT:
+  Classical computer breaking 256-bit ECC: ~2^128 operations (safe forever)
+  Quantum computer breaking 256-bit ECC: ~2^85 operations (feasible 2035-2040)
+
+This means X25519, RSA, and all classical key exchange become insecure
+once sufficiently powerful quantum computers exist.
+
+ML-KEM is based on a completely different mathematical problem that
+quantum computers (as far as we know) CANNOT solve efficiently.
+
+
+PART B: WHAT IS A LATTICE?
+-----------------------------
+A lattice is a grid of points that extends infinitely in all directions.
+
+In 2D, the simplest lattice is the integer grid:
+  { (x, y) : x, y are integers }
+  ...(-2,-2), (-1,-2), (0,-2), (1,-2), (2,-2)...
+  ...(-2,-1), (-1,-1), (0,-1), (1,-1), (2,-1)...
+  ...(-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0)...
+  etc.
+
+In cryptography, we use high-dimensional lattices (256, 512, 1024 dimensions).
+Think of an integer grid but in 1024-dimensional space.
+
+A lattice can also be defined by a "basis" — a set of vectors from which
+all lattice points can be reached by integer combinations.
+
+
+PART C: THE HARD PROBLEM — LWE (Learning With Errors)
+-------------------------------------------------------
+LWE was introduced by Oded Regev in 2005.
+
+THE SETUP:
+  Let n = some dimension (say, 256).
+  Let q = a small prime (say, 3329 for ML-KEM).
+  Let s = a secret vector in Z_q^n  (a list of n numbers, each mod q).
+
+THE SAMPLES:
+  Compute many "noisy" equations:
+    b₁ = a₁ · s + e₁  (mod q)
+    b₂ = a₂ · s + e₂  (mod q)
+    b₃ = a₃ · s + e₃  (mod q)
+    ...
+
+  Where:
+    aᵢ = a random vector (public)
+    bᵢ = the result (public)
+    eᵢ = a tiny random "error" term (secret, small number like ±1 or ±2)
+
+  If there were NO error:
+    b = a · s  → you could solve for s using linear algebra (Gaussian elimination)
+
+  WITH the tiny errors:
+    The equations are "almost" linear but not quite.
+    No efficient algorithm (classical or quantum) is known to find s.
+    This is the LWE problem.
+
+THE KEY INSIGHT:
+  Small errors destroy the algebraic structure that makes linear systems
+  solvable. The problem becomes as hard as finding the shortest vector in
+  a high-dimensional lattice — one of the oldest unsolved problems in
+  computational geometry.
+
+QUANTUM RESISTANCE:
+  Best quantum algorithms (BKZ, sieve algorithms) for LWE:
+  Still exponential in the dimension n. A quantum computer doesn't help
+  significantly, unlike with discrete logarithm.
+
+
+PART D: MODULE-LWE (THE STRUCTURED VERSION USED IN ML-KEM)
+------------------------------------------------------------
+Plain LWE requires very large keys. Module-LWE adds algebraic structure
+using polynomial rings to make keys smaller while keeping hardness.
+
+POLYNOMIAL RING:
+  Instead of working with single numbers, we work with polynomials modulo:
+    Rq = Z_q[x] / (x^n + 1)
+
+  This means: polynomials of degree up to n-1, with coefficients mod q.
+  In ML-KEM-768: n = 256, q = 3329.
+
+  A polynomial looks like:
+    a(x) = a₀ + a₁x + a₂x² + ... + a₂₅₅x²⁵⁵
+    where each aᵢ is an integer from 0 to 3328.
+
+  Multiplication in this ring: multiply polynomials normally,
+  then reduce mod (x^256 + 1), and reduce all coefficients mod 3329.
+
+MODULE-LWE:
+  Work with VECTORS of such polynomials.
+  The "768" in ML-KEM-768 means: we use vectors of length 3
+  (3 × 256 = 768 polynomial coefficients total per vector).
+  Security level 3 out of 5 in NIST's classification.
+
+
+PART E: HOW ML-KEM ACTUALLY WORKS (KEY ENCAPSULATION)
+-------------------------------------------------------
+This is a Key Encapsulation Mechanism (KEM). It does NOT work like DH.
+Instead:
+
+KEY GENERATION (Device A, done once during pairing):
+  1. Generate random secret vector s (the private key) — small coefficients
+  2. Generate random matrix A (public)
+  3. Add small error vector e
+  4. Compute: pk = A·s + e    (over the polynomial ring, mod q)
+  Private key = s
+  Public key  = (A, pk)
+
+ENCAPSULATION (Device B does this when Device A's public key is known):
+  1. Generate random message m (just 32 random bytes initially)
+  2. Use m to derive randomness for the operation (deterministic from m)
+  3. Generate random vector r, error vectors e1, e2
+  4. Compute:
+       u = A·r + e1     (like a "noisy" version of A·r)
+       v = pk·r + e2 + encode(m)  (embed the message into the noise)
+  5. Output: ciphertext c = (u, v) and the encapsulated key K = Hash(m)
+
+DECAPSULATION (Device A does this using its private key s):
+  1. Compute: w = v - s·u
+     = (pk·r + e2 + encode(m)) - s·(A·r + e1)
+     = (A·s + e)·r + e2 + encode(m) - s·A·r - s·e1
+     = A·s·r - s·A·r + e·r + e2 - s·e1 + encode(m)
+     = 0 + (small noise) + encode(m)
+  2. The noise terms are small (because e, e1, e2 were small).
+  3. decode(w) recovers m with high probability.
+  4. Recompute K = Hash(m).
+
+WHY DECAPSULATION WORKS:
+  The errors are small. When Device A computes v - s·u, the error terms
+  are small enough to not change the overall decoded value. The message m
+  sits on top of the noise, big enough to survive.
+
+SECURITY:
+  An eavesdropper sees ciphertext c = (u, v) but not s.
+  To recover m, they must solve Module-LWE: find s from (A, A·s + e).
+  No known efficient classical or quantum algorithm for this.
+
+KEY SIZES IN ML-KEM-768:
+  Public key:  1184 bytes   (3 polynomial vectors)
+  Private key: 2400 bytes   (more material stored for decapsulation)
+  Ciphertext:  1088 bytes   (u + v compressed)
+  Shared key:   32 bytes
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 3: HKDF-SHA256
+  (HMAC-based Key Derivation Function)
+  Used for: combining X25519 and ML-KEM secrets into one session key
+
+==============================================================
+==============================================================
+
+
+PART A: WHAT IS A HASH FUNCTION?
+-----------------------------------
+A hash function takes any input (any size) and outputs a fixed-size string.
+
+Properties of a CRYPTOGRAPHIC hash:
+  1. Deterministic:  same input → always same output
+  2. Fast to compute
+  3. Pre-image resistant:  given output H, cannot find input m such that H(m) = H
+  4. Collision resistant:  cannot find two different inputs with the same output
+  5. Avalanche effect:     change one bit of input → ~50% of output bits change
+
+Example with SHA-256 (256-bit output):
+  SHA-256("hello")     = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+  SHA-256("helo")      = dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986d
+                         ^completely different despite one letter change
+
+WHAT SHA-256 DOES INTERNALLY:
+  (The "Merkle-Damgård" compression function structure)
+  1. Pad input to a multiple of 512 bits
+  2. Split into 512-bit blocks
+  3. Initialise 8 state words (H₀...H₇) with fixed constants
+     (first digits of the fractional parts of square roots of first 8 primes)
+  4. For each 512-bit block, run 64 rounds of mixing:
+     Each round uses bitwise AND, OR, XOR, NOT, and bit-rotations
+     and adds a "round constant" (digits of cube roots of first 64 primes)
+  5. Add the result to the previous state words (Davies-Meyer step)
+  6. Final 256-bit state = the hash
+
+The mixing is designed so the output is indistinguishable from random.
+
+
+PART B: WHAT IS HMAC?
+-----------------------
+HMAC = Hash-based Message Authentication Code.
+Used to verify BOTH the content AND the origin of a message.
+
+Construction:
+  HMAC(key, message) = Hash(key_outer ∥ Hash(key_inner ∥ message))
+
+  Where:
+    key_inner = key XOR ipad   (ipad = 0x36 repeated)
+    key_outer = key XOR opad   (opad = 0x5C repeated)
+    ∥ means concatenation
+
+WHY TWO HASH CALLS?
+  A single Hash(key ∥ message) is vulnerable to "length extension attacks"
+  (due to Merkle-Damgård's structure). The double-hash prevents this.
+
+SECURITY:
+  Without the key, you cannot compute the HMAC. Even knowing the message,
+  you cannot fake the HMAC for any modified version.
+  This gives us "data integrity + authentication" in one operation.
+
+
+PART C: HKDF
+--------------
+HKDF (RFC 5869) turns "source key material" (which might not be uniform)
+into a uniformly random key of any desired length.
+
+TWO PHASES:
+
+  PHASE 1 — Extract:
+    Takes the raw key material (possibly non-uniform) and "extracts" a
+    pseudorandom key (PRK) using HMAC.
+    PRK = HMAC(salt, input_key_material)
+    If no salt is given, use a block of zeros.
+
+  PHASE 2 — Expand:
+    Uses the PRK to produce output key material of any desired length.
+    OKM = T(1) ∥ T(2) ∥ T(3) ∥ ...
+    Where:
+      T(1) = HMAC(PRK, info ∥ 0x01)
+      T(2) = HMAC(PRK, T(1) ∥ info ∥ 0x02)
+      T(3) = HMAC(PRK, T(2) ∥ info ∥ 0x03)
+      ...
+    "info" is a label string (we use "hybrid-session-key" or
+    "proximity-ephemeral-session") that domain-separates different uses.
+
+HOW WE USE IT:
+  X25519 produces a 32-byte shared secret (not necessarily uniform).
+  ML-KEM produces a 32-byte shared secret.
+  We concatenate them: IKM = X25519_secret ∥ ML-KEM_secret  (64 bytes)
+  Then: session_key = HKDF-SHA256(IKM, info="hybrid-session-key")
+  Output: 16 bytes (128 bits) — exactly the size ASCON-128a needs.
+
+WHY CONCATENATE THEN HKDF?
+  This is the standard hybrid KEM construction used by Signal (PQXDH) and
+  TLS 1.3 hybrid drafts. Security guarantee:
+  "As long as AT LEAST ONE of the component secrets is uncompromised,
+  the derived session key is secure."
+  An attacker must break BOTH X25519 AND ML-KEM simultaneously.
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 4: ASCON-128a
+  (Authenticated Encryption with Associated Data)
+  Used for: encrypting every single message in the system
+  Standard: NIST SP 800-232, 2023
+
+==============================================================
+==============================================================
+
+
+PART A: WHAT IS AEAD?
+-----------------------
+AEAD = Authenticated Encryption with Associated Data.
+This is what we actually use to lock messages. It provides:
+
+  CONFIDENTIALITY: nobody can read the message without the key.
+  INTEGRITY:       any modification of the ciphertext is detected.
+  AUTHENTICATION:  proves the message came from someone who has the key.
+
+Associated Data (AD):
+  Data that you want to AUTHENTICATE but NOT encrypt.
+  For example: a header, a nonce, a session ID.
+  AD is checked against the tag but not hidden.
+
+
+PART B: THE SPONGE CONSTRUCTION (foundation of ASCON)
+-------------------------------------------------------
+Most hash functions (SHA-256) use Merkle-Damgård.
+ASCON uses a "Sponge" construction.
+
+SPONGE ANALOGY:
+  Imagine a sponge with a "rate" (the part you can touch) and a
+  "capacity" (the hidden inner core).
+
+  ABSORBING (input):
+    XOR the input data into the "rate" part.
+    Apply the permutation function p (a mixing function).
+    Repeat for each block of input.
+
+  SQUEEZING (output):
+    Read out the "rate" part as output.
+    Apply permutation again.
+    Repeat until you have enough output bits.
+
+STATE:
+  ASCON has a 320-bit internal state (5 words of 64 bits each).
+  Rate   = 128 bits  (the "rate" — data enters and exits here)
+  Capacity = 192 bits  (the hidden core — never directly exposed)
+
+  The capacity is the security parameter. An attacker who sees the
+  rate output cannot reconstruct the capacity without inverting the
+  permutation — which is computationally infeasible.
+
+
+PART C: THE ASCON PERMUTATION (pA, pB)
+----------------------------------------
+ASCON uses a 12-round (pA) or 8-round (pB) permutation.
+Each round has THREE STEPS:
+
+STEP 1 — Constant Addition:
+  XOR a round constant into one word of the 320-bit state.
+  (Different constant each round — prevents slide attacks.)
+
+STEP 2 — Substitution Layer (S-box):
+  Apply a 5-bit S-box to every column of the state simultaneously.
+  The state is 5 words of 64 bits = 64 columns of 5 bits each.
+  Each 5-bit input → a different 5-bit output (lookup table, nonlinear).
+  This provides CONFUSION (obscures relationship between key and output).
+
+  The ASCON S-box (in binary):
+    Input:  00000→00000, 00001→00100, 00010→01011, ...
+    (a fixed nonlinear 5-bit lookup table chosen for good algebraic properties)
+
+STEP 3 — Linear Diffusion Layer:
+  Each of the 5 words is XOR-ed with rotated copies of itself.
+  For word x₀:  x₀ = x₀ XOR (x₀ >>> 19) XOR (x₀ >>> 28)
+  For word x₁:  x₁ = x₁ XOR (x₁ >>> 61) XOR (x₁ >>> 39)
+  (each word has different rotation constants)
+  This provides DIFFUSION (each bit of input affects all bits of output).
+
+WHY THIS IS SECURE:
+  After enough rounds, any change in input propagates to all bits of the
+  state. An attacker cannot find patterns because the S-box destroys linear
+  structure, and diffusion spreads changes everywhere.
+
+
+PART D: ASCON-128a FULL ENCRYPTION FLOW
+-----------------------------------------
+Parameters:
+  Key size:   128 bits  (16 bytes)
+  Nonce size: 128 bits  (16 bytes) — must be UNIQUE per encryption
+  Rate:       128 bits  (16 bytes per block)
+  Tag size:   128 bits  (16 bytes, appended to ciphertext)
+
+STEP 1 — INITIALIZATION:
+  Load initial state: IV ∥ Key ∥ Nonce  (320 bits total)
+  IV = a fixed constant identifying the variant (Ascon-128a).
+  Run permutation pA (12 rounds).
+  XOR the Key into the bottom 128 bits of the state.
+  State is now "keyed and initialized."
+
+STEP 2 — PROCESS ASSOCIATED DATA (if any):
+  Absorb the associated data (AD) in 128-bit blocks:
+    XOR each block into the rate, run pB (8 rounds).
+  After all AD is absorbed:
+    XOR a 1-bit into the state (domain separator: "AD is done").
+
+STEP 3 — ENCRYPTION:
+  For each 128-bit block of plaintext:
+    XOR the plaintext block into the rate.
+    The rate now IS the ciphertext block. Output it.
+    Run pB (8 rounds).
+  (Partial last block: only XOR the available bits, pad with zeros,
+   output only the same number of bits as plaintext length.)
+
+STEP 4 — FINALIZATION:
+  XOR the Key back into the state.
+  Run pA (12 rounds).
+  XOR the Key into the final state.
+  Output the last 128 bits of the state as the authentication TAG.
+
+DECRYPTION:
+  Reverse step 3: XOR ciphertext into rate → get plaintext.
+  Recompute the tag from scratch.
+  Compare computed tag against received tag using CONSTANT-TIME comparison.
+  If tags don't match → reject everything. Output nothing.
+
+THE CONSTANT-TIME COMPARISON:
+  You CANNOT compare tags with a normal "==" check, because:
+  Some languages/CPUs short-circuit and return false as soon as one byte
+  differs. An attacker can time how long the comparison takes to deduce
+  HOW MANY bytes matched, which leaks information about the real tag.
+  Constant-time comparison always compares all 16 bytes in the same time.
+
+
+PART E: WHY ASCON OVER AES?
+------------------------------
+AES (Advanced Encryption Standard):
+  Block cipher, 128-bit blocks, 128/192/256-bit keys.
+  Uses 10/12/14 rounds of SubBytes + ShiftRows + MixColumns + AddRoundKey.
+  Extremely fast WITH hardware support (AES-NI instructions on Intel/AMD CPUs).
+  Problem: on a microcontroller with no AES-NI, AES is slow and code is large.
+
+ASCON:
+  Sponge construction, 320-bit state, designed for SOFTWARE.
+  No lookup tables (S-box is computed with 5 AND/XOR/NOT operations).
+  Tiny code footprint (~2 KB compiled).
+  Designed for IoT chips with 4 KB RAM and no hardware acceleration.
+  Won NIST Lightweight Crypto competition (2019-2023) against 56 candidates.
+  The S-box has 0 fixed points and is 5-bit (trivially protects against
+  timing side-channels because there are no memory lookups at all).
+
+For this project's use case (devices that might be Bluetooth sensors or
+wearables), ASCON is the architecturally correct choice.
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 5: HMAC-SHA256 (for the MAC in proximity protocol)
+  Used for: authenticating ephemeral keys during reconnect
+
+==============================================================
+==============================================================
+
+We already explained HMAC above. Here's how it's specifically used:
+
+During proximity reconnect, Device A needs to PROVE it's the same device
+that completed the original QR pairing, WITHOUT re-doing the full QR scan.
+
+HOW IT WORKS:
+  After pairing, both devices share a long-term secret:
+    DH_result = X25519(my_long_term_priv, peer_long_term_pub)
+  This gives the same 32-byte value on both sides (DH commutativity).
+  We then HKDF this into a "long-term MAC key":
+    lt_key = HKDF(DH_result, info="proximity-long-term-mac-key")
+
+  For every reconnect, Device A stamps its fresh ephemeral keys:
+    MAC = HMAC-SHA256(lt_key, device_id ∥ eph_x25519_pub ∥ eph_mlkem_pub)
+
+  Device B verifies:
+    Compute expected_MAC from the same lt_key.
+    Compare with received MAC using constant-time comparison.
+    Match → authenticated. No match → rejected.
+
+WHY THIS WORKS:
+  Only a device that holds the ORIGINAL long-term private key can compute
+  the same DH_result and therefore the same lt_key. An attacker who
+  intercepted the WiFi during a reconnect sees MAC values but cannot
+  reproduce them without the private key. Even if they replay an old MAC,
+  it binds to specific ephemeral public keys — a replayed MAC with different
+  keys will not verify.
+
+
+==============================================================
+==============================================================
+
+  ALGORITHM 6: SCRYPT
+  (Password-based Key Derivation Function)
+  Used for: encrypting identity.json with a passphrase
+
+==============================================================
+==============================================================
+
+
+THE PROBLEM WITH PLAIN PASSWORD HASHING:
+  SHA-256("mypassword") = fast to compute (< 1ms).
+  An attacker with a GPU can try 10 billion passwords per second.
+  Against a dictionary of 1 billion passwords × 1000 variations = 1 second.
+
+THE SOLUTION: DELIBERATE SLOWNESS AND MEMORY HARDNESS:
+  Make the computation:
+    (a) Deliberately slow (configurable, we target ~100ms)
+    (b) Memory-hard: require a lot of RAM, so GPUs (which have little RAM
+        per core) can't run millions of instances in parallel
+
+SCRYPT (Colin Percival, 2009):
+  Three parameters:
+    N = CPU/memory cost (we use 16384 = 2^14)
+    r = block size factor (we use 8)
+    p = parallelisation factor (we use 1)
+    Memory used: 128 × N × r bytes = 128 × 16384 × 8 = 16 MB
+
+HOW SCRYPT WORKS INTERNALLY:
+  1. Run PBKDF2-HMAC-SHA256 to expand the password into p "blocks"
+     of (128 × r) bytes each.
+
+  2. For each block, run the "ROMix" function:
+     a. Store N sequential hash states in memory (N entries of 128r bytes).
+        This requires N × 128r = 16MB RAM simultaneously.
+     b. For N more rounds, pick a pseudo-random earlier state from memory
+        (determined by the current state) and XOR it in.
+        The random access pattern means you CANNOT compute this without
+        storing all N states. A GPU with 1 MB per core cannot run this.
+
+  3. Run PBKDF2-HMAC-SHA256 again to compress to the desired key size.
+
+RESULT:
+  Computing scrypt(password) takes ~100ms on a modern CPU and ~16 MB of RAM.
+  An attacker can try at most ~10 guesses per second per CPU core.
+  Instead of 10 billion guesses/second → 10 guesses/second.
+  A dictionary attack that took 1 second now takes 3 years.
+
+WHAT WE STORE:
+  A random 16-byte SALT is generated at encryption time.
+  salt + parameters (N, r, p) are stored in identity.json in plaintext.
+  Only the key itself (and therefore the private keys) needs the passphrase.
+  Different salts ensure the same passphrase gives different keys for
+  different identity files — prevents precomputation attacks.
+
+
+==============================================================
+  HOW ALL SIX ALGORITHMS CONNECT IN OUR PROJECT
+==============================================================
+
+PAIRING (first-time, QR-based):
+
+  [Device A's long-term keypairs]
+         X25519 keypair (classical)
+         ML-KEM keypair (quantum-proof)
+         ↓
+  [QR code (out-of-band channel)]
+         Carries: device_id + X25519_pub_A + ML-KEM_pub_A
+         ↓ scanned by Device B
+  [Device B computes session key]
+         X25519: shared = DH(B_priv, A_pub) ← classical secret
+         ML-KEM: (ciphertext, pq_secret) = Encaps(A_pub) ← quantum secret
+         HKDF:   session_key = HKDF(X25519_secret ∥ pq_secret)
+         ASCON:  ciphertext = ASCON(session_key, nonce, B's public keys)
+         ↓ sends ciphertext + ML-KEM ciphertext to Device A
+  [Device A recovers session key]
+         ML-KEM: pq_secret = Decaps(A_priv, ML-KEM_ciphertext)
+         X25519: shared = DH(A_priv, B_pub)
+         HKDF:   session_key = HKDF(X25519_secret ∥ pq_secret) ← SAME KEY
+         ASCON:  B's public keys = ASCON_decrypt(session_key, nonce, ciphertext)
+  [Both compute fingerprint = SHA-256(both devices' public keys)]
+  [Human comparison out loud → confirms authenticity]
+
+PROXIMITY RECONNECT (every subsequent encounter):
+
+  [Device A knows B's long-term public key from pairing]
+  [Compute long-term MAC key]
+         X25519: lt_shared = DH(A_priv_longterm, B_pub_longterm)
+         HKDF:   lt_key = HKDF(lt_shared, info="long-term-mac-key")
+  [Device A generates fresh one-time keys]
+         New X25519 ephemeral keypair
+         New ML-KEM ephemeral keypair
+  [Stamp the fresh keys]
+         HMAC:   mac = HMAC-SHA256(lt_key, device_id ∥ eph_x25519 ∥ eph_mlkem)
+  [Send over WiFi/BLE: device_id + eph_x25519 + eph_mlkem + mac]
+  [Device B verifies stamp]
+         Looks up A's public key from trust store.
+         Computes same lt_key.
+         Verifies HMAC.
+  [Fresh session key]
+         ML-KEM: (kem_ct, pq_secret) = Encaps(A's eph_mlkem_pub)
+         X25519: eph_shared = DH(B_eph_priv, A_eph_pub)
+         HKDF:   session_key = HKDF(eph_shared ∥ pq_secret, "proximity-session")
+  [Encrypt token]
+         ASCON:  token_encrypted = ASCON(session_key, fresh_nonce, token)
+  [Keys discarded after session — forward secrecy]
+
+IDENTITY PROTECTION AT REST:
+
+  passphrase
+         ↓ Scrypt(salt, N=16384, r=8, p=1)
+  16-byte key
+         ↓ ASCON-128a encrypt(key, nonce, private_keys, AD=device_id+pub_keys)
+  Encrypted blob stored in identity.json
+
+
+==============================================================
+  SUMMARY TABLE: WHAT EACH ALGORITHM DOES AND WHY
+==============================================================
+
+ Algorithm    | Hard Problem          | Our Use              | Quantum Safe?
+ -------------|----------------------|----------------------|-------------
+ X25519       | Elliptic Curve DLog  | Classical secret key | NO
+ ML-KEM-768   | Module-LWE (lattice) | PQ secret key        | YES
+ HKDF-SHA256  | Hash preimage        | Key derivation       | YES (hash)
+ ASCON-128a   | Permutation inversion| Message encryption   | YES (128-bit)
+ HMAC-SHA256  | Hash preimage + key  | MAC / authentication | YES (hash)
+ Scrypt       | Memory hardness      | Passphrase → key     | YES (hash)
+
+
+SECURITY LEVELS (NIST classification):
+  Our system targets "Security Level 3" — ML-KEM-768's classification.
+  This means: breaking it requires ~2^128 quantum operations.
+  128-bit post-quantum security is the current recommended minimum for
+  systems that should stay secure beyond 2030.
+
+
+==============================================================
+  THE KEY INTUITION IN ONE PAGE
+==============================================================
+
+The entire system rests on five mathematical facts:
+
+FACT 1: Elliptic curve discrete log is hard.
+  Given G and k×G, you cannot find k.
+  This gives us X25519 — two parties independently compute ab×G.
+
+FACT 2: Module-LWE is hard, even for quantum computers.
+  Given A and A·s + e (with small error), you cannot find s.
+  This gives us ML-KEM — Device B seals a secret only Device A can open.
+
+FACT 3: A cryptographic hash function is a one-way function.
+  Given H(x), you cannot find x.
+  This gives us HKDF (key mixing), HMAC (authentication stamps),
+  and fingerprints (safety numbers).
+
+FACT 4: A pseudorandom permutation with a secret key is indistinguishable
+from a truly random permutation.
+  ASCON's sponge construction, given the correct key and nonce, produces
+  output that looks completely random. No attacker can distinguish real
+  ASCON output from random bytes without the key.
+
+FACT 5: Memory-hard functions equalise the playing field.
+  Scrypt forces every password guess to use 16 MB of RAM for ~100 ms.
+  This removes the GPU/ASIC advantage attackers use to speed up cracking.
+
+PUT TOGETHER:
+  - The QR code brings Fact 1 and Fact 2 to the physical world.
+    An attacker who was never there cannot break Facts 1 or 2.
+  - Fact 3 (HKDF) combines the outputs of Facts 1 and 2 into a key.
+  - Fact 4 (ASCON) uses that key to lock the actual messages.
+  - Facts 3 and 4 together (HMAC) stamp every reconnect so impersonation
+    is impossible without the private key from Fact 1.
+  - Fact 5 (Scrypt) protects private keys if someone steals the file.
+
+==============================================================
+  END
+==============================================================

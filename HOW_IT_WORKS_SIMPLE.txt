@@ -1,0 +1,326 @@
+===============================================================
+  SECURE DEVICE PAIRING — HOW IT WORKS (PLAIN ENGLISH)
+  Written so anyone can understand it, no tech background needed
+===============================================================
+
+
+WHAT IS THIS PROJECT?
+---------------------
+Imagine you have two phones. You want them to talk to each other privately
+— like passing a secret note — so that nobody in the middle can read it,
+change it, or pretend to be you.
+
+That's exactly what this project does. We built a system where:
+  1. Two devices meet and shake hands securely for the first time (pairing)
+  2. Every time they see each other again, they prove who they are and
+     talk in a secret language nobody else can understand (reconnect)
+  3. If a device is lost or stolen, you can cut it off immediately (revoke)
+  4. There's a live website that shows every single step happening on screen
+
+We built the whole thing from scratch — the security math, the app, the
+website, the tests, everything.
+
+
+WHY DOES THIS MATTER?
+---------------------
+Right now when your phone connects to another device (say, AirDrop or
+Bluetooth), there are three big dangers:
+
+  DANGER 1 — Someone sitting in the middle
+    A hacker could pretend to be the other device. You think you're talking
+    to your friend's phone, but really you're talking to the hacker.
+    We call this a "Man in the Middle" (MITM) attack.
+    --> We solved this with a QR code (explained below).
+
+  DANGER 2 — Future quantum computers
+    Normal phone encryption uses maths that today's computers can't break.
+    But quantum computers (coming in the future) can break it.
+    --> We added an extra layer of quantum-proof encryption on top.
+
+  DANGER 3 — Once trusted, always trusted
+    Most pairing systems have no off switch. If you lose your device,
+    it stays trusted forever.
+    --> We built a proper revocation system (like revoking a key card).
+
+
+================================================================
+  WHO BUILT WHAT
+================================================================
+
+
+VIKRAM'S CONTRIBUTIONS
+======================
+
+--- 1. PROTOCOL DESIGN AND THREAT MODEL ---
+
+Before writing a single line of code, Vikram figured out:
+  - What attacks are even possible?
+  - What does a hacker see on the network?
+  - What happens if someone records all the traffic today and tries
+    to decrypt it in 10 years?
+  - What if the device itself gets stolen?
+
+This is called the "threat model" — it's like drawing a map of all the
+ways something can go wrong before you build it, so you can block each
+one deliberately. This thinking lives in docs/SECURITY_ANALYSIS.md.
+
+
+--- 2. CORE CRYPTO — THE MATHS ENGINE (core/ folder) ---
+
+This is the engine room. Vikram built four cryptographic tools from scratch:
+
+  a) X25519 (Elliptic Curve Diffie-Hellman)
+     Think of it like this: Alice and Bob both have a paint colour nobody
+     else knows. They each mix their secret colour into a shared public
+     colour, swap the mixed results, and then add their own secret colour
+     again. They end up with the same final colour — but nobody watching
+     could figure it out just by looking at the colours that were swapped.
+     This is how two devices agree on a secret without ever saying the
+     secret out loud.
+
+  b) ML-KEM-768 (Post-Quantum Encryption, NIST standard)
+     Normal encryption (like X25519 above) will be cracked by quantum
+     computers in the future. ML-KEM-768 is a brand new type of maths
+     (approved by the US government's NIST institute in 2024) that even
+     quantum computers can't break. We use BOTH X25519 and ML-KEM-768
+     together, so you'd have to break TWO different systems simultaneously
+     to crack our encryption. That's basically impossible.
+
+  c) HKDF-SHA256 (Key Mixing)
+     After X25519 and ML-KEM-768 each produce a secret number, we need to
+     turn those two numbers into one single usable key. HKDF is a standard
+     recipe for doing that safely — like combining two ingredients into one
+     perfect sauce. You can't reverse it to find the original ingredients.
+
+  d) ASCON-128a (The Actual Lock and Key for Messages)
+     Once we have a session key, we need to use it to encrypt messages.
+     ASCON-128a is the winner of a global encryption competition run by
+     NIST (the US standards body) in 2023. It was specifically designed
+     for small devices like phones, watches, and sensors — it uses very
+     little memory and doesn't need special hardware chips. Every message
+     sent between devices is locked with ASCON. It also detects if anyone
+     tampered with the message in transit.
+
+
+--- 3. PAIRING — HOW TWO DEVICES MEET FOR THE FIRST TIME (pairing/ folder) ---
+
+This is the "first handshake." Vikram built the whole process:
+
+  STEP 1: Device A generates its identity
+    It creates two keypairs (one classical, one quantum-proof). Think of
+    these like a padlock and a quantum padlock, and only Device A has the
+    keys to open them.
+
+  STEP 2: Device A shows a QR code
+    It encodes its public padlock into a QR code. The QR code is shown on
+    the screen physically — you have to point your camera at it.
+    WHY QR? Because a hacker sitting on the WiFi network CANNOT see the QR
+    code. It's a physical out-of-band channel. They'd have to be physically
+    present and looking at your screen.
+
+  STEP 3: Device B scans the QR
+    Device B reads Device A's public padlock from the QR.
+    It uses that padlock to lock up its own keys and sends them over
+    the network. Only Device A can unlock this — nobody else.
+
+  STEP 4: Both devices get a fingerprint
+    Both devices independently calculate the same unique "safety number"
+    (like a fingerprint of the entire exchange). You read yours out loud,
+    they read theirs — if they match, the pairing was secure. This is
+    exactly what Signal messenger does when you verify a contact.
+
+  STEP 5: Both save the trust record
+    Both devices write down "I trust this peer" in a file. From now on,
+    they can recognise each other every time they meet.
+
+
+--- 4. MITM ATTACK ANALYSIS ---
+
+Vikram also wrote the full security analysis document that maps out:
+  - What a "Man in the Middle" attacker can and cannot do
+  - Why the QR code stops them at the pairing stage
+  - Why even if they record all the network traffic, they can't decrypt it
+  - What is still NOT protected (being honest about limits — like if
+    someone physically steals your phone and extracts the key files)
+  - Why we chose ASCON over AES or DES (ASCON is the modern standard for
+    small devices; AES is fine for servers but not designed for constrained
+    hardware)
+
+
+================================================================
+
+KANIKA'S CONTRIBUTIONS
+=======================
+
+--- 5. PROXIMITY RECONNECT — FINDING EACH OTHER AGAIN (proximity/ folder) ---
+
+After the first pairing, you don't want to scan a QR code every single
+time your devices see each other. Kanika built the automatic reconnect:
+
+  HOW IT WORKS:
+    Every time Device A comes near Device B (via WiFi or Bluetooth):
+
+    a) Device A generates FRESH temporary keys just for this one encounter.
+       These are thrown away immediately after — so even if someone somehow
+       gets them later, they can't decrypt this conversation. This is called
+       "forward secrecy."
+
+    b) Device A stamps those temporary keys with a "signature" (technically
+       an HMAC — a special fingerprint) made using the long-term secret that
+       was established during the original QR pairing. Only a device that
+       genuinely completed the QR pairing can produce this stamp.
+
+    c) Device B checks the stamp. If it's valid → "yes, this is my paired
+       device, let's talk." If it's wrong or missing → silent rejection.
+       The stranger gets no response at all — not even a "no." This is
+       deliberate: telling an attacker "access denied" gives them useful
+       information. Silence gives them nothing.
+
+    d) Both sides independently arrive at the same session key, and the
+       conversation proceeds, fully encrypted with ASCON-128a.
+
+  TRANSPORTS:
+    This works over two different wireless technologies:
+      - WiFi (mDNS discovery + TCP) — live tested, works end to end
+      - Bluetooth BLE — built and unit tested (hardware limitation on
+        Windows prevented live BLE testing, so WiFi was used for the demo)
+
+
+--- 6. TRUST STORE AND STRANGER REJECTION ---
+
+Kanika built the trust management system:
+
+  WHAT IS A TRUST STORE?
+    It's like a contacts book, but for cryptographic identities. When you
+    pair with a device, its name and public keys go into your trust store.
+    Every time a device tries to connect, you first check: "are you in
+    my book?" If not, you slam the door.
+
+  STRANGER REJECTION:
+    If a device you've never paired with tries to connect:
+      - Your device looks them up in the trust store → NOT FOUND
+      - It does not send back any response
+      - The stranger can't tell if your device even exists on the network
+    This is completely automatic. You don't need to do anything.
+
+  REVOCATION (the off switch):
+    Before this was built, once you paired a device it was trusted FOREVER.
+    The only way to unpair was to delete a file manually.
+
+    Now there's a proper off switch:
+      - You can REVOKE a device: "stop trusting this device" (e.g. if you
+        lost your phone). This is reversible — you can restore it later.
+      - You can set an EXPIRY: "trust this device for 30 days, then stop."
+      - A revoked device is rejected with the exact same message as a
+        complete stranger. The attacker can't tell it was specifically
+        revoked — that would leak information.
+
+    Command line example:
+      python -m demo.trust_cli device-a --revoke device-b --reason "lost"
+      python -m demo.trust_cli device-a --restore device-b
+
+
+--- 7. WEBSITE — THE LIVE VISUALIZER (website/ folder) ---
+
+Kanika built the interactive website that makes the whole system visible:
+
+  WHAT IT DOES:
+    Opens in your browser. You click "Pair Fresh" and watch, step by step,
+    exactly what the two devices are doing — the actual hex values of the
+    keys, the encrypted ciphertext, the session key, everything. Nothing
+    is hidden or simplified away. Every real cryptographic value is shown.
+
+  HOW IT WORKS TECHNICALLY:
+    - A FastAPI Python server runs in the background (port 8000)
+    - It performs the real crypto operations (not fake/simulated)
+    - It streams each step to the browser in real time via WebSocket
+      (a persistent live connection, like a phone call between browser
+      and server, so updates appear instantly without page refresh)
+    - There's also a React version of the frontend (port 3000) with a
+      richer interface
+
+  THREE SCENARIOS YOU CAN WATCH LIVE:
+    1. "Pair Fresh" — watch two devices meet for the first time
+    2. "Reconnect" — watch them find each other again with fresh keys
+    3. "Stranger Attack" — watch an unknown device try to connect and
+       get silently rejected, with the fake MAC highlighted in red
+
+
+--- 8. TESTING ATTACK SCENARIOS ---
+
+Kanika wrote tests for the security properties — not just "does it work"
+but "does it correctly FAIL when it should":
+
+  - MITM test: an attacker tries to intercept and relay messages
+  - Stranger test: an unknown device tries to connect → rejected
+  - Reconnect test: previously paired device reconnects → accepted
+  - MAC forgery test: attacker tries to fake the authentication stamp
+  - Tampered message test: attacker flips a bit in the ciphertext →
+    ASCON detects it and refuses to decrypt
+
+These tests run automatically and take under a second each. 131 tests
+total in the project.
+
+
+================================================================
+
+WHAT VIKRAM AND KANIKA BUILT TOGETHER
+======================================
+
+  1. THE FULL PAIRING FLOW END TO END
+     Making sure Vikram's pairing handshake and Kanika's proximity reconnect
+     actually work together as one system. Device A and Device B CLIs
+     (demo/device_a.py and demo/device_b.py) wire everything together.
+
+  2. DOCUMENTATION
+     - README explaining the whole system
+     - README_V2 with Windows-specific setup notes (Kanika added these
+       after hitting real problems installing on Windows)
+     - SECURITY_ANALYSIS.md — the honest breakdown of what's protected and
+       what isn't, with academic citations
+
+  3. IDENTITY ENCRYPTION AT REST
+     Before this, if someone opened the identity.json file on your laptop,
+     they could read your private keys in plain text. Kanika added:
+       - A passphrase lock on the file
+       - The passphrase is turned into a key using Scrypt
+         (a deliberately slow function — makes brute-force guessing
+         the password take months instead of seconds)
+       - The private keys are encrypted with ASCON-128a
+       - If you forget the passphrase, the keys are gone forever
+         (that's the point — if you could recover without the passphrase,
+         so could an attacker)
+
+  4. THIS PRESENTATION
+     The slide deck explaining everything to an audience.
+
+
+================================================================
+
+THE SIMPLE VERSION (what to say to someone non-technical)
+==========================================================
+
+Imagine you want to pass a secret note to your friend across a crowded room.
+
+THE PROBLEM: Anyone could grab the note, read it, or swap it with a fake.
+
+OUR SOLUTION:
+  - First, you show your friend a QR code up close (so only THEY see it).
+    That QR has a secret padlock inside it.
+  - Your friend uses that padlock to seal a note back to you. Only you can
+    open it. Now you both have a shared secret.
+  - Every time you want to talk after that, you each show a little badge
+    stamped with that original shared secret. The badge proves "it's really
+    me." You then use fresh, one-time-only codes for each conversation.
+  - If someone walks up claiming to be your friend but without the badge,
+    they're ignored completely. No answer, no acknowledgement — nothing.
+  - The notes are locked with a type of encryption that even future
+    super-computers (quantum computers) cannot crack.
+  - If your friend loses their phone, you can cancel their badge instantly.
+
+That's it. We built all of that in Python, running on real WiFi, with
+a website where you can watch every step happen live in your browser.
+
+================================================================
+  END OF DOCUMENT
+================================================================
